@@ -22,6 +22,7 @@ import numpy as np
 import os
 import sys
 import socket
+import time
 import configparser
 import logging
 import logging.handlers
@@ -43,7 +44,7 @@ TIMEBASE_CHOICES = [            # s/div offered in the toolbar; 10 divisions on 
     ("10 ms", 10e-3), ("20 ms", 20e-3), ("50 ms", 50e-3),
 ]
 MIN_PERIODS_WARN = 50           # warn if a record holds fewer cycles than this
-CHANNELS = (1, 2)               # channels to capture
+CHANNELS = (1, 2, 3, 4)         # all four inputs; only displayed ones are read
 VISA_TIMEOUT_MS = 60000         # a 1 Mpt transfer is slow
 LOG_SERVER_IP = "132.68.74.143" # lab log server; ignored if unreachable
 USE_LOG_SERVER = False          # set True inside the lab network
@@ -126,6 +127,10 @@ class Oscilloscope:
             rm = pyvisa.ResourceManager('@py')
         self.inst = rm.open_resource(address)
         self.inst.timeout = VISA_TIMEOUT_MS
+        try:
+            self.inst.chunk_size = 1024 * 1024          # faster big binary reads
+        except Exception:
+            pass
         self.raw_points = raw_points
         self.idn = self.inst.query("*IDN?").strip()
 
@@ -186,6 +191,20 @@ class Oscilloscope:
                 continue
         return None
 
+    def _set_transfer_timeout(self, npoints):
+        """Give the waveform transfer its own, much longer timeout.
+
+        The acquisition timeout is scaled to the timebase and can be as short
+        as 15 s. That is fine for ':DIGitize', but a deep-memory ':WAVeform:DATA?'
+        moves 2 bytes per point over USB and easily needs a minute. Reusing the
+        acquisition timeout here is what made Deep memory fail while the
+        1000-point mode worked.
+        """
+        secs = 30.0 + (npoints * 2) / 50000.0        # pessimistic 50 kB/s link
+        secs = min(600.0, secs)
+        self.inst.timeout = int(secs * 1000)
+        return secs
+
     def _acquire(self, active):
         """Take one acquisition without ever blocking forever.
 
@@ -210,6 +229,21 @@ class Oscilloscope:
                 v.write(":TRIGger:SWEep AUTO")
         except Exception as e:
             logger.debug("Could not read/set trigger sweep: %s", e)
+
+        # ':DIGitize' only works in a time-base mode. In XY the scope has no
+        # time axis at all, and in ROLL it never reports the acquisition as
+        # complete, so '*OPC?' blocks until the timeout. Switch to MAIN for
+        # the duration of the capture and put the instrument back afterwards.
+        self._prev_tb_mode = None
+        try:
+            mode = v.query(":TIMebase:MODE?").strip().upper()
+            if not mode.startswith("MAIN"):
+                logger.info("Scope timebase mode is %s — switching to MAIN to acquire", mode)
+                self._prev_tb_mode = mode
+                v.write(":TIMebase:MODE MAIN")
+                v.query("*OPC?")
+        except Exception as e:
+            logger.debug("Could not read/set timebase mode: %s", e)
 
         try:
             tb_range = float(v.query(":TIMebase:RANGe?"))
@@ -251,6 +285,8 @@ class Oscilloscope:
                 v.clear()
             except Exception:
                 pass
+            self._restore_sweep(prev_sweep)
+            self._restore_timebase_mode()
             raise RuntimeError(
                 "Scope did not respond.\n\n"
                 "Check that a signal is present and that the trigger is set to Auto "
@@ -264,6 +300,22 @@ class Oscilloscope:
                 self.inst.write(f":TRIGger:SWEep {prev_sweep}")
             except Exception:
                 pass
+
+    def _restore_timebase_mode(self):
+        """Put the scope back into XY or ROLL after the data has been read.
+
+        This must happen after ':WAVeform:DATA?', not before: leaving MAIN
+        restarts acquisition and can invalidate the memory we are reading.
+        """
+        mode = getattr(self, "_prev_tb_mode", None)
+        if not mode:
+            return
+        try:
+            self.inst.write(f":TIMebase:MODE {mode}")
+            logger.info("Timebase mode restored to %s", mode)
+        except Exception:
+            pass
+        self._prev_tb_mode = None
 
     def get_trace(self, channels=CHANNELS, deep=True):
         """Single acquisition, then read the waveform for each channel.
@@ -292,14 +344,34 @@ class Oscilloscope:
             v.write(":WAVeform:UNSigned 0")
             v.write(":WAVeform:POINts:MODE " + ("RAW" if deep else "NORMal"))
             if deep:
-                v.write(f":WAVeform:POINts {int(self.raw_points)}")
+                # Ask for no more than the scope actually holds. Requesting a
+                # million points when only 500k were acquired makes the reply
+                # unpredictable on some firmware.
+                try:
+                    avail = int(float(v.query(":ACQuire:POINts?")))
+                except Exception:
+                    avail = int(self.raw_points)
+                want = min(int(self.raw_points), max(1000, avail))
+                v.write(f":WAVeform:POINts {want}")
+
+            try:
+                npts = int(float(v.query(":WAVeform:POINts?")))
+            except Exception:
+                npts = int(self.raw_points) if deep else 1000
+
+            secs = self._set_transfer_timeout(npts)
+            logger.info("CH%d: transferring %d points, timeout %.0f s", ch, npts, secs)
 
             pre = v.query(":WAVeform:PREamble?").strip().split(',')
             xinc, xorg, xref = float(pre[4]), float(pre[5]), float(pre[6])
             yinc, yorg, yref = float(pre[7]), float(pre[8]), float(pre[9])
 
+            t_start = time.time()
             raw = v.query_binary_values(":WAVeform:DATA?", datatype='h',
                                         container=np.array)
+            dt_transfer = max(1e-3, time.time() - t_start)
+            logger.info("CH%d: got %d points in %.1f s (%.0f kB/s)",
+                        ch, len(raw), dt_transfer, len(raw) * 2 / 1000 / dt_transfer)
             data.append((raw - yref) * yinc + yorg)
 
             if t_axis is None or len(data[-1]) < len(t_axis):
@@ -309,6 +381,7 @@ class Oscilloscope:
             scales.append(float(v.query(f":CHANnel{ch}:SCALe?")))
             names.append(f"CH{ch}")
 
+        self._restore_timebase_mode()
         try:
             v.write(":RUN")                                # leave the scope running
         except Exception:
@@ -396,14 +469,13 @@ class App:
         self.is_capturing = False
 
         self.xy_mode = False            # False = voltage vs time, True = phase portrait
-        self.xy_swap = False            # which channel goes on the X axis
 
         self.dark_mode = False
         self.themes = {
             'light': {'bg': 'white',   'grid': '#c0c0c0', 'grid_minor': '#e0e0e0',
-                      'tick': '#333333', 'ch1': 'tab:blue', 'ch2': 'tab:orange'},
+                      'tick': '#333333', 'ch': ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']},
             'dark':  {'bg': '#1a1a1a', 'grid': '#404040', 'grid_minor': '#2a2a2a',
-                      'tick': '#b0b0b0', 'ch1': '#FFE040', 'ch2': '#40FF40'},
+                      'tick': '#b0b0b0', 'ch': ['#FFE040', '#40FF40', '#40D0FF', '#FF7070']},
         }
 
         self.status_var = tk.StringVar()
@@ -437,9 +509,18 @@ class App:
         self.xy_btn = tk.Button(frame, text="XY", width=6, command=self.toggle_xy)
         self.xy_btn.pack(side=tk.LEFT, padx=(15, 2))
 
-        self.swap_btn = tk.Button(frame, text="⇄ X/Y", command=self.toggle_swap,
-                                  state=tk.DISABLED)
-        self.swap_btn.pack(side=tk.LEFT, padx=2)
+        self.xsel_var = tk.StringVar(value="CH1")
+        self.ysel_var = tk.StringVar(value="CH2")
+        tk.Label(frame, text="X:").pack(side=tk.LEFT, padx=(6, 0))
+        self.xsel = ttk.Combobox(frame, textvariable=self.xsel_var, width=5,
+                                 state="disabled", values=["CH1", "CH2"])
+        self.xsel.pack(side=tk.LEFT, padx=1)
+        tk.Label(frame, text="Y:").pack(side=tk.LEFT, padx=(4, 0))
+        self.ysel = ttk.Combobox(frame, textvariable=self.ysel_var, width=5,
+                                 state="disabled", values=["CH1", "CH2"])
+        self.ysel.pack(side=tk.LEFT, padx=1)
+        for box in (self.xsel, self.ysel):
+            box.bind("<<ComboboxSelected>>", lambda e: self.redraw_plot())
 
         tk.Label(frame, text="s/div:").pack(side=tk.LEFT, padx=(15, 2))
         self.tb_var = tk.StringVar(value="20 ms")
@@ -473,6 +554,36 @@ class App:
     def on_deep_toggle(self):
         self.deep_memory = self.deep_var.get()
         logger.info("Deep memory set to %s", self.deep_memory)
+
+    def sync_xy_selectors(self):
+        """Offer exactly the channels that were actually captured."""
+        names = list(self.chs)
+        if not names:
+            return
+        for box, var, default in ((self.xsel, self.xsel_var, 0),
+                                  (self.ysel, self.ysel_var, min(1, len(names) - 1))):
+            box.config(values=names)
+            if var.get() not in names:
+                var.set(names[default])
+
+    def sync_timebase_box(self):
+        """Make the combobox show what the scope is actually set to.
+
+        Previously the box said '20 ms' while the scope sat at 1 ms/div,
+        because the default value is never pushed to the instrument — only a
+        user selection triggers that. Showing the truth is safer than silently
+        changing the operator's setting on connect.
+        """
+        if not self.scope or not self.timebase:
+            return
+        per_div = self.timebase[0] / 10.0
+        name = min(TIMEBASE_CHOICES, key=lambda kv: abs(kv[1] - per_div))[0]
+        self.tb_var.set(name)
+        # A record much shorter than a few hundred cycles cannot show a switch
+        # between scrolls, so flag it here rather than after the capture.
+        if per_div < 5e-3:
+            logger.info("Scope is at %s/div — short records; 20 ms/div "
+                        "recommended for the attractor", name)
 
     def on_timebase_change(self, event=None):
         """Push the chosen s/div to the scope and refresh the empty grid."""
@@ -514,13 +625,10 @@ class App:
         self.xy_mode = not self.xy_mode
         self.xy_btn.config(text="Y(t)" if self.xy_mode else "XY",
                            relief=tk.SUNKEN if self.xy_mode else tk.RAISED)
-        self.swap_btn.config(state=tk.NORMAL if self.xy_mode else tk.DISABLED)
+        state = "readonly" if self.xy_mode else "disabled"
+        self.xsel.config(state=state)
+        self.ysel.config(state=state)
         logger.info("Display mode: %s", "XY" if self.xy_mode else "Y(t)")
-        self.redraw_plot()
-
-    def toggle_swap(self):
-        self.xy_swap = not self.xy_swap
-        logger.info("XY axes swapped: %s", self.xy_swap)
         self.redraw_plot()
 
     def check_input_impedance(self):
@@ -621,7 +729,13 @@ class App:
         t = self.get_theme()
         has_data = self.time is not None and self.y is not None and self.y.shape[1] >= 2
 
-        ix, iy = (1, 0) if self.xy_swap else (0, 1)
+        try:
+            ix = self.chs.index(self.xsel_var.get())
+            iy = self.chs.index(self.ysel_var.get())
+        except ValueError:
+            ix, iy = 0, 1
+        if ix == iy:                                   # degenerate: would be a line
+            iy = (ix + 1) % len(self.chs)
         xname, yname = self.chs[ix], self.chs[iy]
 
         self.ax.set_xlim(self.offsets[ix] - 4 * self.scales[ix],
@@ -630,8 +744,8 @@ class App:
                          self.offsets[iy] + 4 * self.scales[iy])
         self.setup_scope_grid(self.ax, time_per_div=self.scales[ix],
                               volts_per_div=self.scales[iy])
-        self.ax.set_xlabel(f"{xname} ({self.scales[ix]:.2f} V/div)", color=t['ch1'])
-        self.ax.set_ylabel(f"{yname} ({self.scales[iy]:.2f} V/div)", color=t['ch2'])
+        self.ax.set_xlabel(f"{xname} ({self.scales[ix]:.2f} V/div)", color=t['ch'][ix % 4])
+        self.ax.set_ylabel(f"{yname} ({self.scales[iy]:.2f} V/div)", color=t['ch'][iy % 4])
 
         if not has_data:
             return
@@ -640,7 +754,7 @@ class App:
         stride = max(1, int(np.ceil(n / XY_MAX_POINTS)))
         x = self.y[::stride, ix]
         yv = self.y[::stride, iy]
-        colour = t['ch2'] if self.dark_mode else 'tab:red'
+        colour = t['ch'][1] if self.dark_mode else 'tab:red'
 
         # Thin, semi-transparent line: where the trajectory passes many times
         # the colour builds up, so the layered sheets of the attractor stay
@@ -655,9 +769,18 @@ class App:
                     m, n, stride, alpha)
 
     def draw_yt(self):
+        """Voltage against time.
+
+        Up to two channels get their own calibrated y axis, left and right.
+        With three or four that stops working — you cannot hang four axes on
+        one plot legibly — so everything is drawn in units of scope divisions
+        instead, exactly as the instrument itself displays it. Each trace keeps
+        its own V/div and offset, shown in the legend.
+        """
         t = self.get_theme()
         has_data = self.time_disp is not None and self.y_disp is not None
         num_ch = len(self.chs)
+        cols = t['ch']
 
         self.ax.xaxis.set_major_formatter(FuncFormatter(self.format_time_english))
 
@@ -669,31 +792,43 @@ class App:
         elif has_data:
             self.ax.set_xlim(self.time_disp[0], self.time_disp[-1])
 
-        volts_per_div_ch1 = self.scales[0] if num_ch >= 1 else None
-        self.setup_scope_grid(self.ax, time_per_div=time_per_div,
-                              volts_per_div=volts_per_div_ch1)
-
-        if num_ch >= 1:
-            self.ax.set_ylabel(f"{self.chs[0]} ({self.scales[0]:.2f} V/div)", color=t['ch1'])
-            self.ax.set_ylim(self.offsets[0] - 4 * self.scales[0],
-                             self.offsets[0] + 4 * self.scales[0])
-
-        if num_ch >= 2:
-            self.ax2 = self.ax.twinx()
-            self.ax2.set_ylabel(f"{self.chs[1]} ({self.scales[1]:.2f} V/div)", color=t['ch2'])
-            self.ax2.set_ylim(self.offsets[1] - 4 * self.scales[1],
-                              self.offsets[1] + 4 * self.scales[1])
-            self.ax2.yaxis.set_major_locator(MultipleLocator(self.scales[1]))
-            self.ax2.yaxis.set_minor_locator(MultipleLocator(self.scales[1] / 5))
-            self.ax2.tick_params(colors=t['tick'])
-
-        if has_data:
+        if num_ch <= 2:
+            volts_per_div = self.scales[0] if num_ch >= 1 else None
+            self.setup_scope_grid(self.ax, time_per_div=time_per_div,
+                                  volts_per_div=volts_per_div)
             if num_ch >= 1:
-                self.ax.plot(self.time_disp, self.y_disp[:, 0], color=t['ch1'],
+                self.ax.set_ylabel(f"{self.chs[0]} ({self.scales[0]:.2f} V/div)",
+                                   color=cols[0])
+                self.ax.set_ylim(self.offsets[0] - 4 * self.scales[0],
+                                 self.offsets[0] + 4 * self.scales[0])
+            if num_ch >= 2:
+                self.ax2 = self.ax.twinx()
+                self.ax2.set_ylabel(f"{self.chs[1]} ({self.scales[1]:.2f} V/div)",
+                                    color=cols[1])
+                self.ax2.set_ylim(self.offsets[1] - 4 * self.scales[1],
+                                  self.offsets[1] + 4 * self.scales[1])
+                self.ax2.yaxis.set_major_locator(MultipleLocator(self.scales[1]))
+                self.ax2.yaxis.set_minor_locator(MultipleLocator(self.scales[1] / 5))
+                self.ax2.tick_params(colors=t['tick'])
+            if has_data:
+                self.ax.plot(self.time_disp, self.y_disp[:, 0], color=cols[0],
                              linewidth=1.0, zorder=2)
-            if num_ch >= 2 and self.ax2:
-                self.ax2.plot(self.time_disp, self.y_disp[:, 1], color=t['ch2'],
-                              linewidth=1.0, zorder=1)
+                if num_ch >= 2 and self.ax2:
+                    self.ax2.plot(self.time_disp, self.y_disp[:, 1], color=cols[1],
+                                  linewidth=1.0, zorder=1)
+            return
+
+        # three or four channels: common axis in divisions
+        self.setup_scope_grid(self.ax, time_per_div=time_per_div, volts_per_div=1.0)
+        self.ax.set_ylim(-4, 4)
+        self.ax.set_ylabel("делений от нуля канала")
+        if has_data:
+            for i in range(num_ch):
+                d = (self.y_disp[:, i] - self.offsets[i]) / self.scales[i]
+                self.ax.plot(self.time_disp, d, color=cols[i % len(cols)],
+                             linewidth=1.0, zorder=2 + i,
+                             label=f"{self.chs[i]}  {self.scales[i]:.2f} V/div")
+            self.ax.legend(loc='upper right', fontsize=8, ncol=num_ch, framealpha=0.6)
 
     # ---------------- status ----------------
     def start_blink(self):
@@ -760,6 +895,7 @@ class App:
             self.scales = s['scales']
             self.time = self.y = self.time_disp = self.y_disp = None
             self.redraw_plot()
+            self.sync_timebase_box()
             logger.info("Scope settings: timebase=%s, channels=%s", self.timebase, self.chs)
         except Exception as e:
             logger.warning("Could not read scope settings: %s", e)
@@ -807,12 +943,14 @@ class App:
         self.stop_blink()
         self.status_icon.itemconfig(self.status_circle, fill="green")
 
+        self.sync_xy_selectors()
         self.time_disp, self.y_disp = envelope_decimate(self.time, self.y,
                                                         MAX_DISPLAY_POINTS)
         if self.xy_mode and len(self.chs) < 2:                 # XY needs both channels
             self.xy_mode = False
             self.xy_btn.config(text="XY", relief=tk.RAISED)
-            self.swap_btn.config(state=tk.DISABLED)
+            self.xsel.config(state="disabled")
+            self.ysel.config(state="disabled")
         self.redraw_plot()
         self.save_btn.config(state=tk.NORMAL)
 
