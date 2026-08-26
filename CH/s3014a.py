@@ -1039,10 +1039,15 @@ class App:
             np.savetxt(file_path, block, delimiter=',', header=header,
                        comments='', fmt='%.6e')
             size_mb = os.path.getsize(file_path) / 1e6
-            logger.info("Saved %s (%d points, %.1f MB)", file_path, len(self.time), size_mb)
+            # No modal dialog here: saving happens after almost every capture, and
+            # a popup that must be dismissed each time breaks the rhythm of a sweep.
+            # The full path goes to the console and to the status bar instead.
+            logger.info("SAVED  %s  (%d points, %.1f MB)",
+                        file_path, len(self.time), size_mb)
             self.remember_save_path(os.path.dirname(file_path))
-            messagebox.showinfo("Success",
-                                f"Saved to {file_path}\n{len(self.time)} points, {size_mb:.1f} MB")
+            self.status_var.set(
+                f"{os.path.basename(file_path)} \u2713 {len(self.time)} pts, "
+                f"{size_mb:.1f} MB | {self.scope_idn}")
         except Exception as e:
             logger.error("File save failed: %s", e)
             messagebox.showerror("Save error", str(e))
