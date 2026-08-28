@@ -11,6 +11,11 @@ L1 and L2 are the measured rod lengths (px); L1_out / L2_out are 1 for the
 frames where the length left the tolerance band set on the Settings tab, i.e.
 where the marker was mis-detected.
 
+The file starts with a '#' comment block holding the version, the settings and
+the diagnostics of that run. Read it back with
+    pandas.read_csv(path, comment='#')          (pandas needs comment='#')
+    numpy.genfromtxt(path, delimiter=',', names=True)
+
 theta1 is the angle of the rod origin -> M1, theta2 the angle of the rod
 M1 -> M2. Both are measured from the downward vertical: 0 when the rod hangs
 straight down, positive towards the right, and the values stay inside
@@ -34,8 +39,28 @@ Dependencies:
 
 Based on the scripts by Anton S. (dp_traj_extract_main.py,
 dp_post_processing.py, dp_extraction_utils.py)
-Version: 3.0
+
+CHANGELOG
+    3.4  time axis from the per-frame container timestamps, rescaled by the
+         slow-motion factor (median frame interval); dropped frames detected
+         and reported instead of silently compressing the record
+    3.3  origin refined by a circle fit to the M1 trajectory; search gate for
+         the detector; capture-FPS sanity check against the playback rate;
+         interpolation gap limit; aborted / truncated runs marked
+    3.2  rod length validation with a tolerance, L1/L2 and L1_out/L2_out
+         columns, bad frames drawn in red on the control video
+    3.1  angles kept in (-180, +180] by default, unwrapping optional; plot
+         rebuilt without pyplot so it opens more than once
+    3.0  Main / Settings tabs, config.ini, folders, control video carries the
+         rods and the angle readout (preview button dropped), tighter layout
+    2.2  omega columns dropped from the CSV, angle definition fixed (branch cut
+         moved to straight up), frame-rate probing
+    2.1  scrollable panel, zoom and pan, built-in player for the control video
+    2.0  first GUI version: file dialogs, background tracking, CSV export
+    1.x  original command line scripts by Anton S.
 """
+
+__version__ = "3.4.0"
 
 import configparser
 import os
@@ -66,12 +91,17 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.ini")
 
 DEFAULTS = {
+    "version": __version__,
     "fps": "120",
     "h_margin": "10",
     "s_margin": "75",
     "v_margin": "75",
     "min_area": "100",
+    "gate": "120",
     "len_tol": "10",
+    "origin_fit": "1",
+    "max_gap": "5",
+    "use_timestamps": "1",
     "degrees": "1",
     "unwrap": "0",
     "interpolate": "1",
@@ -138,22 +168,46 @@ def color_mask(hsv_frame, filt):
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
 
 
-def detect_color(frame_bgr, filt, min_size=100, hsv_frame=None):
-    """Return (cx, cy, found, bbox) for the largest blob of the given colour."""
+def detect_color(frame_bgr, filt, min_size=100, hsv_frame=None,
+                 prev=None, gate=0.0):
+    """Return (cx, cy, found, bbox) for the blob of the given colour.
+
+    Without a gate the largest blob in the whole frame wins, which lets the
+    track jump onto any similarly coloured object. With prev=(x, y) and
+    gate > 0 only blobs whose centroid lies within `gate` pixels of the
+    previous position are considered: a marker cannot teleport between two
+    consecutive frames. If nothing is inside the gate the frame counts as a
+    miss (and the caller widens the gate), instead of silently locking onto
+    the wrong object.
+    """
     if hsv_frame is None:
         hsv_frame = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
     mask = color_mask(hsv_frame, filt)
     bbox = (0, 0, 0, 0)
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+
+    cands = []
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < min_size:
+            continue
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            continue
+        cands.append((area, M["m10"] / M["m00"], M["m01"] / M["m00"],
+                      cv2.boundingRect(c)))
+    if not cands:
         return 0, 0, False, bbox
-    c = max(contours, key=cv2.contourArea)
-    if cv2.contourArea(c) < min_size:
-        return 0, 0, False, bbox
-    M = cv2.moments(c)
-    if M["m00"] == 0:
-        return 0, 0, False, bbox
-    return M["m10"] / M["m00"], M["m01"] / M["m00"], True, cv2.boundingRect(c)
+
+    if prev is not None and gate and gate > 0:
+        near = [c for c in cands
+                if (c[1] - prev[0]) ** 2 + (c[2] - prev[1]) ** 2 <= gate * gate]
+        if not near:
+            return 0, 0, False, bbox
+        cands = near
+
+    area, cx, cy, rect = max(cands, key=lambda c: c[0])
+    return cx, cy, True, rect
 
 
 def draw_crosshair(img, center, size=20, color=(0, 0, 255), thickness=2):
@@ -168,6 +222,166 @@ def add_marker(img, bbox, color):
         return
     cv2.rectangle(img, (x, y), (x + w, y + h), color, 2)
     cv2.circle(img, (x + w // 2, y + h // 2), 5, color, -1)
+
+
+def sanitize_timestamps(ts_ms):
+    """Raw container timestamps [ms] -> clean playback time axis [s] from zero.
+
+    Occasional repeated or out-of-order stamps (they happen, especially around
+    the first frame and with B-frames) are repaired by linear interpolation
+    over the good ones. Returns (t_seconds, n_repaired) or (None, 0) if the
+    stamps are hopeless.
+    """
+    ts = np.asarray(ts_ms, dtype=np.float64)
+    n = ts.size
+    if n < 5 or not np.all(np.isfinite(ts)):
+        return None, 0
+    good = np.zeros(n, dtype=bool)
+    last = -np.inf
+    for i in range(n):
+        if ts[i] > last:
+            good[i] = True
+            last = ts[i]
+    good[0] = True
+    n_bad = int(n - good.sum())
+    if good.sum() < max(5, 0.9 * n):
+        return None, 0
+    idx = np.arange(n, dtype=np.float64)
+    ts = np.interp(idx, idx[good], ts[good])
+    t = (ts - ts[0]) / 1000.0
+    if t[-1] <= 0:
+        return None, 0
+    return t, n_bad
+
+
+def playback_fps(path):
+    """Frame rate at which the file plays back, measured, not copied.
+
+    Seeks to the last frame and reads its timestamp, so this is
+    (n_frames - 1) / duration rather than the nominal metadata value.
+    Returns (fps, n_frames) or (None, n).
+    """
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None, 0
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps_meta = cap.get(cv2.CAP_PROP_FPS)
+    fps = None
+    ts = []
+    for _ in range(600):            # nominal cadence from the first frames
+        ret, _f = cap.read()
+        if not ret:
+            break
+        ts.append(cap.get(cv2.CAP_PROP_POS_MSEC))
+    cap.release()
+    if len(ts) > 5:
+        d = np.diff(np.asarray(ts, dtype=np.float64))
+        d = d[(d > 1e-6) & np.isfinite(d)]
+        if d.size > 3:
+            # median, not mean: dropped frames must not bias the nominal rate
+            fps = 1000.0 / float(np.median(d))
+    if fps is None or not np.isfinite(fps) or fps <= 0:
+        fps = fps_meta if fps_meta and fps_meta > 0 else None
+    return fps, n
+
+
+def check_fps(entered, play_fps):
+    """Sanity-check the capture rate the user typed against the file.
+
+    The ratio capture/playback is the slow-motion factor: 1 for an ordinary
+    clip, an integer (2, 4, 5, 8, 10) for a clip exported already slowed down.
+    Anything else is almost always a typo or the wrong file. This cannot prove
+    the rate is right -- only a physical reference (a free-fall calibration
+    clip) can -- but it catches gross mistakes.
+    """
+    if not play_fps or play_fps <= 0 or not entered or entered <= 0:
+        return "playback rate unknown - the capture FPS cannot be checked"
+    ratio = entered / play_fps
+    txt = f"file plays at {play_fps:.4g} fps, entered {entered:g} -> factor x{ratio:.3g}"
+    if abs(ratio - 1) < 0.02:
+        return txt + " (real time, consistent)"
+    for k in (2, 3, 4, 5, 8, 10, 16, 20):
+        if abs(ratio - k) < 0.02 * k:
+            return txt + f" (slow motion x{k}, consistent)"
+    return "WARNING: " + txt + " - not a plausible slow-motion factor, check the "\
+                               "capture FPS or the file"
+
+
+def fit_circle(x, y, n_iter=2, clip_sigma=3.0):
+    """Least-squares circle through the points; returns (cx, cy, R, sigma, n).
+
+    The masses move on circles about their joints, so the centre of the circle
+    fitted to the M1 trajectory IS the pivot -- far more accurate than a mouse
+    click. Algebraic (Kasa) fit with a couple of sigma-clipping passes.
+    """
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    keep = np.isfinite(x) & np.isfinite(y)
+    cx = cy = R = np.nan
+    for _ in range(max(1, n_iter)):
+        if keep.sum() < 10:
+            return np.nan, np.nan, np.nan, np.nan, int(keep.sum())
+        xs, ys = x[keep], y[keep]
+        A = np.column_stack([2 * xs, 2 * ys, np.ones(xs.size)])
+        b = xs ** 2 + ys ** 2
+        try:
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+        except np.linalg.LinAlgError:
+            return np.nan, np.nan, np.nan, np.nan, int(keep.sum())
+        cx, cy = float(sol[0]), float(sol[1])
+        R = float(np.sqrt(max(0.0, sol[2] + cx ** 2 + cy ** 2)))
+        res = np.hypot(x - cx, y - cy) - R
+        sigma = float(np.std(res[keep]))
+        if not np.isfinite(sigma) or sigma == 0:
+            break
+        keep = keep & (np.abs(res) < clip_sigma * sigma)
+    res = np.hypot(x[keep] - cx, y[keep] - cy) - R
+    return cx, cy, R, float(np.std(res)), int(keep.sum())
+
+
+def angular_span_deg(x, y):
+    """Angular extent covered by the points around their own mean centre.
+
+    A circle fit needs a decent arc: a pendulum that barely moves gives an
+    ill-conditioned fit and the 'refined' centre would be nonsense.
+    """
+    ang = np.unwrap(np.sort(np.arctan2(np.asarray(y), np.asarray(x))))
+    if ang.size < 3:
+        return 0.0
+    gaps = np.diff(np.sort(np.mod(ang, 2 * np.pi)))
+    largest_gap = max(gaps.max() if gaps.size else 0.0,
+                      2 * np.pi - (np.sort(np.mod(ang, 2 * np.pi))[-1]
+                                   - np.sort(np.mod(ang, 2 * np.pi))[0]))
+    return float(np.degrees(2 * np.pi - largest_gap))
+
+
+def interp_with_gap_limit(t, valid, values, max_gap):
+    """Linear interpolation over invalid samples, but only across short gaps.
+
+    Gaps longer than max_gap consecutive frames are left as NaN: silently
+    bridging a long dropout invents a straight line where the real trajectory
+    is curved, and that bias is invisible afterwards.
+    """
+    out = np.interp(t, t[valid], values[valid])
+    if max_gap is not None and max_gap >= 0:
+        bad = ~valid
+        i = 0
+        n = bad.size
+        while i < n:
+            if bad[i]:
+                j = i
+                while j < n and bad[j]:
+                    j += 1
+                if (j - i) > max_gap:
+                    out[i:j] = np.nan
+                i = j
+            else:
+                i += 1
+    # nothing to extrapolate from before the first / after the last valid point
+    first, last = np.argmax(valid), valid.size - 1 - np.argmax(valid[::-1])
+    out[:first] = np.nan
+    out[last + 1:] = np.nan
+    return out
 
 
 def compute_angles(x1, y1, x2, y2, unwrap=True):
@@ -192,9 +406,11 @@ def compute_angles(x1, y1, x2, y2, unwrap=True):
     """
     th1 = np.arctan2(x1, y1)
     th2 = np.arctan2(x2 - x1, y2 - y1)
-    if unwrap:
-        th1 = np.unwrap(th1)
-        th2 = np.unwrap(th2)
+    if unwrap:                       # NaN gaps must not poison the rest
+        for th in (th1, th2):
+            m = np.isfinite(th)
+            if m.sum() > 1:
+                th[m] = np.unwrap(th[m])
     return th1, th2
 
 
@@ -286,11 +502,30 @@ class TrackerJob(threading.Thread):
         ref1, ref2 = cfg.get("len_ref", (None, None))
         rows, found1, found2 = [], [], []
         k = 0
+        gate0 = float(cfg.get("gate", 0) or 0)
+        prev = [None, None]        # last accepted position of M1 / M2
+        miss = [0, 0]              # consecutive misses -> the gate opens up
+        stamps = []
         ret, frame = cap.read()
+        # POS_MSEC read *after* a successful read belongs to that very frame;
+        # read before the first grab it is stale by one frame
+        t_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
         while ret and not self.stop_flag.is_set():
+            stamps.append(t_ms)
             hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-            cx1, cy1, f1, b1 = detect_color(frame, cfg["filt1"], cfg["min_size"], hsv)
-            cx2, cy2, f2, b2 = detect_color(frame, cfg["filt2"], cfg["min_size"], hsv)
+            # the gate grows with every missed frame; after 10 misses the search
+            # goes global again so the track can re-acquire after an occlusion
+            g = [0.0 if (gate0 <= 0 or prev[i] is None or miss[i] > 10)
+                 else gate0 * (1 + miss[i]) for i in (0, 1)]
+            cx1, cy1, f1, b1 = detect_color(frame, cfg["filt1"], cfg["min_size"],
+                                            hsv, prev[0], g[0])
+            cx2, cy2, f2, b2 = detect_color(frame, cfg["filt2"], cfg["min_size"],
+                                            hsv, prev[1], g[1])
+            for i, (fd, pos) in enumerate(((f1, (cx1, cy1)), (f2, (cx2, cy2)))):
+                if fd:
+                    prev[i], miss[i] = pos, 0
+                else:
+                    miss[i] += 1
 
             rows.append([cx1 - ox, cy1 - oy, cx2 - ox, cy2 - oy])
             found1.append(bool(f1))
@@ -318,6 +553,7 @@ class TrackerJob(threading.Thread):
                 self.progress_cb(k, max(1, n_total - start),
                                  int(np.sum(found1)), int(np.sum(found2)))
             ret, frame = cap.read()
+            t_ms = cap.get(cv2.CAP_PROP_POS_MSEC)
 
         cap.release()
         if out_video is not None:
@@ -325,11 +561,75 @@ class TrackerJob(threading.Thread):
         if k == 0:
             raise RuntimeError("No frames were read.")
 
+        aborted = self.stop_flag.is_set()
+        expected = max(0, n_total - start)
+        truncated = (not aborted) and expected > 0 and k < expected - 1
+
         arr = np.asarray(rows, dtype=np.float64)
         x1, y1, x2, y2 = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
         f1 = np.asarray(found1, dtype=bool)
         f2 = np.asarray(found2, dtype=bool)
+        # ---- time axis -------------------------------------------------
+        # Uniform 1/fps is an assumption; the container timestamps are a
+        # measurement of the PLAYBACK time. For an already-slowed slow-motion
+        # clip the playback second is (fps_capture / fps_playback) physical
+        # seconds, so the measured axis only has to be rescaled by that factor.
+        # Shape from the file, scale from the capture rate the user entered.
         t = np.arange(k, dtype=np.float64) / cfg["fps"]
+        time_note = f"time: uniform 1/{cfg['fps']:g} s"
+        drop_note = ""
+        if cfg.get("use_timestamps", True):
+            t_pts, n_rep = (sanitize_timestamps(stamps)
+                            if len(stamps) == k else (None, 0))
+            if t_pts is not None:
+                # The slow-motion factor comes from the MEDIAN frame interval of
+                # this very run, not from an average over the file: a dropped
+                # frame must not shift the scale, only stretch its own gap.
+                med_pts = float(np.median(np.diff(t_pts))) if t_pts.size > 1 else 0.0
+                slow = cfg["fps"] * med_pts if med_pts > 0 else 1.0
+                t = t_pts / slow if slow > 0 else t_pts
+                dt = np.diff(t)
+                med = float(np.median(dt)) if dt.size else 0.0
+                worst = float(np.max(np.abs(dt - med))) if dt.size else 0.0
+                n_gap = int(np.sum(dt > 1.5 * med)) if med > 0 else 0
+                time_note = (f"time: file timestamps / x{slow:.4g} slow motion "
+                             f"-> {1/med if med else float('nan'):.5g} fps"
+                             + (f", {n_rep} stamps repaired" if n_rep else ""))
+                if n_gap:
+                    drop_note = (f"  {n_gap} frame intervals are longer than 1.5x "
+                                 f"the median (worst {1000*worst:.1f} ms): the "
+                                 f"camera dropped frames - the timestamps keep "
+                                 f"the timing right, a uniform grid would not.")
+                elif worst > 0.25 * med:
+                    drop_note = (f"  timestamp jitter up to {1000*worst:.1f} ms "
+                                 f"({100*worst/med:.0f}% of the frame interval).")
+            else:
+                time_note = (f"time: timestamps unusable, fell back to uniform "
+                             f"1/{cfg['fps']:g} s")
+
+        # ---- refine the origin by fitting a circle to the M1 trajectory ----
+        origin_note = "origin: as clicked"
+        origin_shift = (0.0, 0.0)
+        if cfg.get("origin_fit", True):
+            span = angular_span_deg(x1[f1], y1[f1]) if f1.sum() > 10 else 0.0
+            cx, cy, R, sig, n_used = fit_circle(x1[f1], y1[f1])
+            r_click = float(np.median(np.hypot(x1[f1], y1[f1]))) if f1.any() else 0.0
+            shift = float(np.hypot(cx, cy)) if np.isfinite(cx) else np.inf
+            if not np.isfinite(R) or R <= 0 or span < 25.0:
+                origin_note = (f"origin: circle fit skipped, the arc covers only "
+                               f"{span:.0f} deg")
+            elif shift > 0.25 * max(R, r_click):
+                origin_note = (f"origin: circle fit rejected, it moved the pivot by "
+                               f"{shift:.1f} px (>25% of R={R:.1f})")
+            else:
+                x1, y1 = x1 - cx, y1 - cy
+                x2, y2 = x2 - cx, y2 - cy
+                ref1 = R
+                origin_shift = (cx, cy)
+                origin_note = (f"origin: circle fit moved the pivot by {shift:.2f} px "
+                               f"(dx={cx:+.2f}, dy={cy:+.2f}), R={R:.2f} px, "
+                               f"residual {sig:.2f} px over {n_used} frames, "
+                               f"arc {span:.0f} deg")
 
         # ---- rod length validation ------------------------------------
         # Both rods are rigid, so their length is a constant: any frame where
@@ -354,15 +654,16 @@ class TrackerJob(threading.Thread):
                     "tolerance on the Settings tab." % (ok1.sum(), ok2.sum(), k))
             # M1 first, then M2 against the repaired M1: rod 2 is measured
             # from M1, so a bad M1 would also condemn a good M2
-            x1 = np.interp(t, t[ok1], x1[ok1])
-            y1 = np.interp(t, t[ok1], y1[ok1])
+            gap = cfg.get("max_gap", 5)
+            x1 = interp_with_gap_limit(t, ok1, x1, gap)
+            y1 = interp_with_gap_limit(t, ok1, y1, gap)
             len2 = np.hypot(x2 - x1, y2 - y1)
             ok2 = f2 & (np.abs(len2 - ref2) <= tol * ref2)
             if ok2.sum() < 2:
                 raise RuntimeError("Too few valid frames for M2 after repairing "
                                    "M1. Check the tolerance and the margins.")
-            x2 = np.interp(t, t[ok2], x2[ok2])
-            y2 = np.interp(t, t[ok2], y2[ok2])
+            x2 = interp_with_gap_limit(t, ok2, x2, gap)
+            y2 = interp_with_gap_limit(t, ok2, y2, gap)
 
         # lengths and flags reported in the CSV refer to the exported points
         len1 = np.hypot(x1, y1)
@@ -377,11 +678,15 @@ class TrackerJob(threading.Thread):
         th1, th2 = compute_angles(x1, y1, x2, y2, unwrap=cfg.get("unwrap", False))
 
         # diagnostics are always measured on the continuous version
-        u1, u2 = compute_angles(x1, y1, x2, y2, unwrap=True)
-        jump = (float(np.max(np.abs(np.diff(u1)))) if k > 1 else 0.0,
-                float(np.max(np.abs(np.diff(u2)))) if k > 1 else 0.0)
-        rods = ((float(len1.mean()), float(len1.min()), float(len1.max())),
-                (float(len2.mean()), float(len2.min()), float(len2.max())))
+        u1, u2 = compute_angles(x1.copy(), y1.copy(), x2.copy(), y2.copy(),
+                                unwrap=True)
+        jump = tuple(float(np.nanmax(np.abs(np.diff(u)))) if k > 1 else 0.0
+                     for u in (u1, u2))
+        rods = ((float(np.nanmean(len1)), float(np.nanmin(len1)),
+                 float(np.nanmax(len1))),
+                (float(np.nanmean(len2)), float(np.nanmin(len2)),
+                 float(np.nanmax(len2))))
+        n_nan = int(np.sum(~np.isfinite(x1) | ~np.isfinite(x2)))
 
         if cfg["degrees"]:
             th1, th2 = np.degrees(th1), np.degrees(th2)
@@ -396,6 +701,11 @@ class TrackerJob(threading.Thread):
             "df": df, "n_frames": k,
             "len_ref": (ref1, ref2), "len_tol": tol * 100.0,
             "n_out": (int(out1.sum()), int(out2.sum())),
+            "n_nan": n_nan,
+            "origin_note": origin_note, "origin_shift": origin_shift,
+            "time_note": time_note, "drop_note": drop_note,
+            "aborted": aborted, "truncated": truncated,
+            "expected_frames": expected,
             "found1": int(f1.sum()), "found2": int(f2.sum()),
             "units": "deg" if cfg["degrees"] else "rad",
             "cols": ("theta1" + suffix, "theta2" + suffix),
@@ -403,7 +713,8 @@ class TrackerJob(threading.Thread):
             "max_jump_deg": (np.degrees(jump[0]), np.degrees(jump[1])),
             "rods": rods,
             "unwrapped": bool(cfg.get("unwrap", False)),
-            "turns2": float((u2[-1] - u2[0]) / (2 * np.pi)) if k > 1 else 0.0,
+            "turns2": (float((u2[np.isfinite(u2)][-1] - u2[np.isfinite(u2)][0])
+                             / (2 * np.pi)) if np.isfinite(u2).sum() > 1 else 0.0),
         }
 
 
@@ -421,7 +732,7 @@ def clamp(v, lo, hi):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Double Pendulum Tracker")
+        self.title(f"Double Pendulum Tracker  v{__version__}")
 
         # the video area is sized to fit the actual screen (small laptops too)
         sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
@@ -433,6 +744,7 @@ class App(tk.Tk):
 
         # --- media state
         self.video_path = None
+        self.play_fps = None
         self.track_path = None
         self.viewing = "source"      # 'source' | 'tracking'
         self.cap = None
@@ -559,7 +871,12 @@ class App(tk.Tk):
         r.pack(fill="x", pady=(4, 0))
         ttk.Label(r, text="capture FPS:").pack(side="left")
         self.var_fps = tk.StringVar(value=self.cfg["fps"])
-        ttk.Entry(r, textvariable=self.var_fps, width=8).pack(side="right")
+        e = ttk.Entry(r, textvariable=self.var_fps, width=8)
+        e.pack(side="right")
+        e.bind("<FocusOut>", lambda _e: self.update_fps_check())
+        e.bind("<Return>", lambda _e: self.update_fps_check())
+        self.lbl_fpschk = ttk.Label(m, text="", wraplength=270, foreground="#555")
+        self.lbl_fpschk.pack(anchor="w")
 
         sep(m)
         ttk.Label(m, text="2. Geometry", font=("", 9, "bold")).pack(anchor="w")
@@ -636,6 +953,20 @@ class App(tk.Tk):
             ttk.Spinbox(row, from_=1, to=hi, textvariable=var,
                         width=7).pack(side="right")
 
+        row = ttk.Frame(s)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="search gate, px (0 = off)").pack(side="left")
+        self.var_gate = tk.IntVar(value=int(self.cfg["gate"]))
+        ttk.Spinbox(row, from_=0, to=4000, textvariable=self.var_gate,
+                    width=7).pack(side="right")
+        ttk.Label(s, foreground="#666", wraplength=270, justify="left",
+                  text="Only blobs within this distance of the previous position "
+                       "are accepted, so the track cannot jump onto another "
+                       "object of a similar colour. The gate widens after every "
+                       "lost frame and opens fully after 10, to re-acquire the "
+                       "marker. Set it to a few times the per-frame displacement."
+                  ).pack(anchor="w")
+
         sep(s)
         ttk.Label(s, text="Rod length check", font=("", 9, "bold")).pack(anchor="w")
         row = ttk.Frame(s)
@@ -650,6 +981,41 @@ class App(tk.Tk):
                        "(L1_out / L2_out), drawn in red on the control video and, "
                        "with interpolation on, replaced by interpolated points."
                   ).pack(anchor="w")
+
+        row = ttk.Frame(s)
+        row.pack(fill="x", pady=(4, 0))
+        ttk.Label(row, text="max interpolated gap, frames").pack(side="left")
+        self.var_gap = tk.IntVar(value=int(self.cfg["max_gap"]))
+        ttk.Spinbox(row, from_=0, to=1000, textvariable=self.var_gap,
+                    width=6).pack(side="right")
+        ttk.Label(s, foreground="#666", wraplength=270, justify="left",
+                  text="Longer dropouts are left empty in the CSV instead of "
+                       "being bridged by a straight line.").pack(anchor="w")
+
+        sep(s)
+        ttk.Label(s, text="Time axis", font=("", 9, "bold")).pack(anchor="w")
+        self.var_ts = tk.BooleanVar(value=self.cfg["use_timestamps"] == "1")
+        ttk.Checkbutton(s, text="use file timestamps (scaled by slow motion)",
+                        variable=self.var_ts).pack(anchor="w")
+        ttk.Label(s, foreground="#666", wraplength=270, justify="left",
+                  text="Timestamps measure PLAYBACK time, so they are divided by "
+                       "the slow-motion factor (capture FPS / playback FPS) to "
+                       "give physical seconds. Their advantage over a uniform "
+                       "1/FPS grid is that dropped or irregular frames keep "
+                       "their true spacing. Off = uniform grid."
+                  ).pack(anchor="w")
+
+        sep(s)
+        ttk.Label(s, text="Origin", font=("", 9, "bold")).pack(anchor="w")
+        self.var_ofit = tk.BooleanVar(value=self.cfg["origin_fit"] == "1")
+        ttk.Checkbutton(s, text="refine origin by circle fit",
+                        variable=self.var_ofit).pack(anchor="w")
+        ttk.Label(s, foreground="#666", wraplength=270, justify="left",
+                  text="M1 moves on a circle about the pivot, so the fitted centre "
+                       "is the pivot. It replaces the clicked point (a click is "
+                       "good to a couple of pixels, which is ~1-2 deg of theta1). "
+                       "Skipped when the swing is too small or the correction is "
+                       "implausibly large.").pack(anchor="w")
 
         sep(s)
         ttk.Label(s, text="Output", font=("", 9, "bold")).pack(anchor="w")
@@ -677,6 +1043,12 @@ class App(tk.Tk):
                    command=self.save_settings).pack(fill="x")
         ttk.Label(s, text=CONFIG_PATH, wraplength=270,
                   foreground="#666").pack(anchor="w", pady=(2, 0))
+        ttk.Label(s, text=f"dp_gui.py version {__version__}",
+                  font=("", 9, "bold")).pack(anchor="w", pady=(6, 0))
+        if self.cfg.get("version") and self.cfg["version"] != __version__:
+            ttk.Label(s, foreground="#a60", wraplength=270,
+                      text=f"config.ini was written by version "
+                           f"{self.cfg['version']}").pack(anchor="w")
         ttk.Label(s, foreground="#666", wraplength=270, justify="left",
                   text="Angles: theta = 0 when the rod hangs down, positive to "
                        "the right, range +/-180 deg. Rod 1 = origin -> M1, "
@@ -687,12 +1059,17 @@ class App(tk.Tk):
     # ================================================== config =========
     def collect_config(self):
         return {
+            "version": __version__,
             "fps": self.var_fps.get(),
             "h_margin": str(self.var_h.get()),
             "s_margin": str(self.var_s.get()),
             "v_margin": str(self.var_v.get()),
             "min_area": str(self.var_min.get()),
+            "gate": str(self.var_gate.get()),
             "len_tol": str(self.var_lentol.get()),
+            "origin_fit": "1" if self.var_ofit.get() else "0",
+            "max_gap": str(self.var_gap.get()),
+            "use_timestamps": "1" if self.var_ts.get() else "0",
             "degrees": "1" if self.var_deg.get() else "0",
             "unwrap": "1" if self.var_unwrap.get() else "0",
             "interpolate": "1" if self.var_interp.get() else "0",
@@ -763,6 +1140,8 @@ class App(tk.Tk):
         self.zoom_reset(render=False)
         self.slider.config(from_=0, to=max(0, self.n_frames - 1))
         self.goto(0)
+        self.play_fps, _n = playback_fps(path)
+        self.update_fps_check()
         self.set_status(f"{os.path.basename(path)} - {self.n_frames} frames. "
                         f"Set the origin, the start frame and both marker colours.")
 
@@ -1071,6 +1450,11 @@ class App(tk.Tk):
                 return
             self.origin = (0.0, 0.0)
 
+        chk = self.update_fps_check() or ""
+        if chk.startswith("WARNING") and not messagebox.askyesno(
+                "Frame rate looks wrong", chk + "\n\nRun anyway?"):
+            return
+
         self.stop_play()
         hm, sm, vm = self.var_h.get(), self.var_s.get(), self.var_v.get()
         out_vid = (os.path.splitext(self.video_path)[0] + "_tracking.mp4"
@@ -1085,8 +1469,13 @@ class App(tk.Tk):
             "filt1": build_filter(self.hsv1, hm, sm, vm),
             "filt2": build_filter(self.hsv2, hm, sm, vm),
             "min_size": self.var_min.get(),
+            "gate": self.var_gate.get(),
             "len_tol": self.var_lentol.get(),
             "len_ref": ref,
+            "origin_fit": self.var_ofit.get(),
+            "max_gap": self.var_gap.get(),
+            "use_timestamps": self.var_ts.get(),
+            "play_fps": self.play_fps,
             "interpolate": self.var_interp.get(),
             "degrees": self.var_deg.get(),
             "unwrap": self.var_unwrap.get(),
@@ -1101,6 +1490,16 @@ class App(tk.Tk):
         self.save_settings(quiet=True)
         self.job = TrackerJob(cfg, self._on_progress, self._on_done)
         self.job.start()
+
+    def update_fps_check(self):
+        """Compare the typed capture rate with the file's playback rate."""
+        if not self.video_path:
+            return
+        txt = check_fps(self.get_fps(), self.play_fps)
+        self.lbl_fpschk.config(text=txt,
+                               foreground="#a00" if txt.startswith("WARNING")
+                               else "#555")
+        return txt
 
     def measure_rods(self, filt1, filt2):
         """Reference rod lengths, measured on the start (marking) frame.
@@ -1151,7 +1550,14 @@ class App(tk.Tk):
             n = result["n_frames"]
             j1, j2 = result["max_jump_deg"]
             (m1, lo1, hi1), (m2, lo2, hi2) = result["rods"]
-            msg = (f"Done: {n} frames; M1 detected in {result['found1']} "
+            head = ""
+            if result["aborted"]:
+                head = "RUN ABORTED (partial data!)  "
+            elif result["truncated"]:
+                head = (f"DECODING STOPPED EARLY: {n} of "
+                        f"{result['expected_frames']} frames!  ")
+            msg = (head +
+                   f"Done: {n} frames; M1 detected in {result['found1']} "
                    f"({100*result['found1']/n:.1f}%), M2 in {result['found2']} "
                    f"({100*result['found2']/n:.1f}%); max angle step per frame "
                    f"{j1:.1f} / {j2:.1f} deg; rod lengths "
@@ -1168,6 +1574,17 @@ class App(tk.Tk):
             if max(o1, o2) > 0.1 * n:
                 msg += ("  WARNING: more than 10% of the frames are mis-detected "
                         "- adjust the filter margins or the tolerance.")
+            if result["n_nan"]:
+                msg += (f"  {result['n_nan']} frames left empty (gaps longer than "
+                        f"{self.var_gap.get()} frames were not interpolated).")
+            msg += ("  " + result["origin_note"] + ".  " +
+                    result["time_note"] + "." + result["drop_note"])
+            if result["aborted"] or result["truncated"]:
+                messagebox.showwarning(
+                    "Incomplete run",
+                    "The run did not cover the whole video:\n\n" + head.strip() +
+                    "\n\nThe data are usable but partial - the saved file name "
+                    "gets a _PARTIAL suffix.")
             if result["unwrapped"] and abs(result["turns2"]) > 0.5:
                 msg += (f"  Note: rod 2 winds {result['turns2']:+.1f} turns; with "
                         "unwrapping on, theta2 leaves the +/-180 deg range.")
@@ -1193,6 +1610,8 @@ class App(tk.Tk):
         if not self.result:
             return
         base = os.path.splitext(os.path.basename(self.video_path))[0]
+        if self.result.get("aborted") or self.result.get("truncated"):
+            base += "_PARTIAL"
         path = filedialog.asksaveasfilename(
             defaultextension=".csv", initialfile=base + "_angles.csv",
             initialdir=(self.var_csvdir.get()
@@ -1200,8 +1619,16 @@ class App(tk.Tk):
             filetypes=[("CSV", "*.csv")])
         if not path:
             return
-        # the units are part of the column names: theta1_deg / theta1_rad
-        self.result["df"].to_csv(path, index=False)
+        # the units are part of the column names: theta1_deg / theta1_rad;
+        # the provenance block goes on top as '#' comment lines
+        try:
+            head = ["# " + ln if ln else "#" for ln in self.meta_lines()]
+        except Exception as e:
+            head = ["# meta block failed: %s" % e]
+            print("Could not build the meta block:", e, file=sys.stderr)
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write("\n".join(head) + "\n")
+            self.result["df"].to_csv(fh, index=False, lineterminator="\n")
         if not self.var_csvdir.get():
             self.var_csvdir.set(os.path.dirname(path))
         png = os.path.splitext(path)[0] + ".png"
@@ -1211,8 +1638,65 @@ class App(tk.Tk):
             png = "(plot failed)"
             print("Could not save the plot:", e, file=sys.stderr)
         self.save_settings(quiet=True)
-        self.set_status(f"Saved: {path}")
+        self.set_status(f"Saved: {path}  (header carries the run metadata; "
+                        f"read it with pandas.read_csv(..., comment='#'))")
         self.lbl_saved.config(text=f"Saved:\n{path}\n{png}")
+
+    def meta_lines(self):
+        """Provenance block written as '#' comments on top of the data file.
+
+        A data file whose provenance is not recorded cannot be re-checked
+        months later, so every export carries its version and settings.
+        """
+        import datetime
+        r = self.result
+        lines = [
+            f"dp_gui.py version : {__version__}",
+            f"written           : {datetime.datetime.now().isoformat(timespec='seconds')}",
+            f"source video      : {self.video_path}",
+            "",
+            f"frames processed  : {r['n_frames']} (start frame {self.start_frame})",
+            f"detected M1 / M2  : {r['found1']} / {r['found2']}",
+            f"length out of tol : {r['n_out'][0]} / {r['n_out'][1]}",
+            f"left empty (NaN)  : {r['n_nan']}",
+            f"rod refs L1 / L2  : {r['len_ref'][0]:.2f} / {r['len_ref'][1]:.2f} px"
+            f"  (tolerance {r['len_tol']:.1f}%)",
+            f"max angle step    : {r['max_jump_deg'][0]:.2f} / "
+            f"{r['max_jump_deg'][1]:.2f} deg per frame",
+            f"origin clicked    : {self.origin[0]:.2f}, {self.origin[1]:.2f} px",
+            f"origin correction : {r['origin_shift'][0]:+.2f}, "
+            f"{r['origin_shift'][1]:+.2f} px",
+            f"{r['origin_note']}",
+            f"{r['time_note']}",
+        ]
+        if r["drop_note"]:
+            lines.append(r["drop_note"].strip())
+        if r["aborted"]:
+            lines.append("RUN ABORTED - the data cover only part of the video")
+        if r["truncated"]:
+            lines.append(f"DECODING STOPPED EARLY - {r['n_frames']} of "
+                         f"{r['expected_frames']} frames")
+        lines += ["", "settings:"]
+        lines += [f"  {k:14s} = {v}" for k, v in sorted(self.collect_config().items())]
+        lines += [
+            "",
+            "columns: Time [s]; X1,Y1,X2,Y2 [px] from the origin, image axes "
+            "(y down); theta1,theta2 from the downward vertical, + to the right;",
+            "         L1,L2 rod lengths [px]; L1_out,L2_out = 1 where the length "
+            "left the tolerance band (mis-detected frame).",
+            "",
+            "read with:  pandas.read_csv(path, comment='#')",
+            "            numpy.genfromtxt(path, delimiter=',', names=True, "
+            "skip_header={n})",
+            "            numpy.loadtxt(path, delimiter=',', skiprows={n} + 1)",
+        ]
+        # the very first line states how many '#' lines there are, so the numpy
+        # readers (which need skip_header, not a comment character) can be told
+        n = len(lines) + 1
+        lines = [f"dp_gui {__version__} data file - {n} header lines start "
+                 f"with '#', then the column names"] + \
+                [ln.replace("{n}", str(n)) for ln in lines]
+        return lines
 
     def _make_figure(self):
         """Build the angle figure.
@@ -1234,7 +1718,13 @@ class App(tk.Tk):
             a.set_ylabel(lab)
             a.grid(alpha=.4)
         ax2.set_xlabel("Time [s]")
-        fig.suptitle(f"{os.path.basename(self.video_path)}\n"
+        mark = ""
+        if self.result.get("aborted"):
+            mark = "  [RUN ABORTED - PARTIAL DATA]"
+        elif self.result.get("truncated"):
+            mark = "  [DECODING STOPPED EARLY - PARTIAL DATA]"
+        fig.suptitle(f"{os.path.basename(self.video_path)}{mark}   "
+                     f"(dp_gui {__version__})\n"
                      f"IC: $\\theta_1$={df[c1].iloc[0]:.2f}, "
                      f"$\\theta_2$={df[c2].iloc[0]:.2f} [{u}]")
         fig.tight_layout()
