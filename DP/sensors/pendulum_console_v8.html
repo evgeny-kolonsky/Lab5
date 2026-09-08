@@ -1,0 +1,1033 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Double Pendulum Console</title>
+<style>
+  :root{
+    --bg:#0f1216; --panel:#171c22; --line:#252d36;
+    --txt:#e6edf3; --dim:#8b98a5;
+    --acc:#4da3ff; --acc2:#ffb454; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--txt);
+       font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  .wrap{max-width:1180px;margin:0 auto;padding:20px}
+  header{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+  h1{font-size:19px;margin:0;font-weight:600}
+  .grow{flex:1}
+  button{background:#222a33;color:var(--txt);border:1px solid var(--line);
+         border-radius:8px;padding:9px 15px;font-size:14px;cursor:pointer;
+         font-family:inherit;transition:.12s}
+  button:hover:not(:disabled){background:#2b343f;border-color:#3a4652}
+  button:disabled{opacity:.35;cursor:not-allowed}
+  button.pri{background:var(--acc);border-color:var(--acc);color:#04121f;font-weight:600}
+  button.pri:hover:not(:disabled){background:#69b2ff}
+  button.rec{background:var(--err);border-color:var(--err);color:#fff;font-weight:600}
+  button.rec:hover:not(:disabled){background:#ff6a60}
+  button.sm{padding:5px 10px;font-size:12px}
+  select{background:#222a33;color:var(--txt);border:1px solid var(--line);
+         border-radius:8px;padding:9px 10px;font-size:14px;font-family:inherit}
+  label.chk{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--dim);
+            cursor:pointer;user-select:none}
+  .grid{display:grid;grid-template-columns:1fr 360px;gap:16px}
+  @media(max-width:900px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px}
+  .card h2{font-size:12px;text-transform:uppercase;letter-spacing:.8px;
+           color:var(--dim);margin:0 0 12px;font-weight:600;
+           display:flex;align-items:center;gap:8px}
+  #stage{width:100%;height:auto;display:block}
+  .angles{display:flex;gap:20px;justify-content:center;margin-top:6px}
+  .ang{text-align:center}
+  .ang u{display:block;text-decoration:none;font-size:11px;color:var(--dim);
+         text-transform:uppercase;letter-spacing:.6px}
+  .ang b{font-family:var(--mono);font-size:26px;font-weight:600}
+  .a1 b{color:var(--acc)} .a2 b{color:var(--acc2)}
+  .node{border:1px solid var(--line);border-radius:10px;padding:12px;margin-bottom:12px;
+        background:#12171d}
+  .node.on{border-color:#1f4a2a}
+  .nhead{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+  .nhead b{font-size:14px}
+  .tag{font-size:11px;font-family:var(--mono);padding:2px 8px;border-radius:20px;
+       border:1px solid var(--line);color:var(--dim)}
+  .tag.c1{color:var(--acc);border-color:#1d3a57}
+  .tag.c2{color:var(--acc2);border-color:#584a2a}
+  .row{display:flex;justify-content:space-between;align-items:center;gap:8px;
+       font-size:13px;margin:5px 0}
+  .row span{color:var(--dim)}
+  .row b{font-family:var(--mono);font-weight:600}
+  .bar{height:6px;background:#0c1015;border-radius:4px;overflow:hidden;
+       border:1px solid var(--line);margin:4px 0 8px}
+  .bar i{display:block;height:100%;width:0;background:var(--ok);transition:width .3s}
+  .bar i.w{background:var(--warn)} .bar i.r{background:var(--err)}
+  .nbtns{display:flex;gap:7px;flex-wrap:wrap;margin-top:9px}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3d4650}
+  .dot.on{background:var(--ok);box-shadow:0 0 7px var(--ok)}
+  .dot.rc{background:var(--err);box-shadow:0 0 7px var(--err);animation:p 1s infinite}
+  @keyframes p{50%{opacity:.25}}
+  #chart{width:100%;height:240px;display:block}
+  .legend{display:flex;gap:16px;font-size:12px;color:var(--dim);margin-top:6px}
+  .legend i{display:inline-block;width:12px;height:3px;vertical-align:middle;margin-right:5px}
+  .note{color:var(--dim);font-size:12.5px;margin-top:10px;line-height:1.5}
+  details{margin-top:16px}
+  summary{cursor:pointer;color:var(--dim);font-size:12px;text-transform:uppercase;
+          letter-spacing:.8px;font-weight:600}
+  textarea{width:100%;height:140px;background:#0c1015;color:var(--dim);
+           border:1px solid var(--line);border-radius:8px;padding:10px;
+           font-family:var(--mono);font-size:12px;margin-top:10px;resize:vertical}
+  table{width:100%;border-collapse:collapse;font-family:var(--mono);font-size:12px;
+        margin-top:10px}
+  td{padding:4px 6px;border-bottom:1px solid var(--line);color:var(--dim)}
+  td:first-child{color:var(--txt)}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Double Pendulum Console</h1>
+  <span class="grow"></span>
+  <select id="rate">
+    <option value="50">50 Hz</option>
+    <option value="100">100 Hz</option>
+    <option value="200" selected>200 Hz</option>
+    <option value="500">500 Hz</option>
+  </select>
+  <button id="btnRec" class="rec" disabled>● Record</button>
+  <button id="btnStop" disabled>■ Stop</button>
+  <button id="btnDl" disabled>Download data</button>
+  <button id="btnMerge" disabled>Download aligned</button>
+</header>
+
+<div class="grid">
+  <div>
+    <div class="card">
+      <h2>Live motion</h2>
+      <svg id="stage" viewBox="0 0 520 420"></svg>
+      <div class="angles">
+        <div class="ang a1"><u>θ1 · upper arm</u><b id="th1">—</b></div>
+        <div class="ang a2"><u>θ2 · lower arm</u><b id="th2">—</b></div>
+      </div>
+      <div class="note" style="text-align:center">
+        <label class="chk" style="display:inline-flex">
+          <input type="checkbox" id="relMode" checked>
+          lower encoder measures the angle relative to the upper arm
+        </label>
+        <div style="display:flex;gap:16px;justify-content:center;align-items:center;margin-top:8px;flex-wrap:wrap">
+          <label class="chk"><input type="checkbox" id="trails"> show trajectory trails</label>
+          <select id="trailLen" style="padding:4px 8px;font-size:12px">
+            <option value="180">3 s</option>
+            <option value="600" selected>10 s</option>
+            <option value="1800">30 s</option>
+            <option value="0">keep everything</option>
+          </select>
+          <button class="sm" id="btnTrailClr">Clear trails</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" style="margin-top:16px">
+      <h2>Angles over time</h2>
+      <canvas id="chart"></canvas>
+      <div class="legend">
+        <span><i style="background:var(--acc)"></i>θ1 upper</span>
+        <span><i style="background:var(--acc2)"></i>θ2 lower</span>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <div class="card">
+      <h2>Sensors</h2>
+      <div id="nodes"></div>
+      <div class="note" id="note">
+        Connect one or both nodes. The rig works with a single sensor —
+        the missing arm is drawn dimmed.
+      </div>
+    </div>
+  </div>
+</div>
+
+<details id="settings">
+  <summary>Settings &amp; index-zero calibration</summary>
+  <div class="card" style="margin-top:10px">
+    <label class="chk" style="margin-bottom:12px">
+      <input type="checkbox" id="useIdxZero" checked>
+      use the index pulse as the angle zero when it is available
+    </label>
+    <div id="calibHost"></div>
+    <div class="note" style="margin-top:12px">
+      Paste this into the top of the file (block <b>AXIS_CALIBRATION</b>) so the
+      values travel with the page instead of living in one browser:
+    </div>
+    <textarea id="calCode" readonly style="height:80px"></textarea>
+    <button class="sm" id="btnCopyCal">Copy for the file</button>
+    <div class="note">
+      The index pulse fires at one fixed mechanical position of the shaft, once per
+      full turn. Calibration stores how far that position sits from the arm hanging
+      at rest, so from then on the zero is restored automatically — no manual
+      zeroing, and angles stay comparable between sessions.
+      <br><br>
+      <b>How to calibrate one arm:</b> let it hang still at its resting position,
+      press <i>Calibrate</i>, then turn the arm slowly through at least one full
+      revolution. The moment the index passes, the offset is written to the
+      device flash and survives reboots and battery changes.
+      <br><br>
+      An arm that never completes a full turn during an experiment keeps the
+      last zero it captured; if it has never seen the index since power-up,
+      fall back to the manual <i>Set zero</i> button.
+    </div>
+  </div>
+</details>
+
+<details>
+  <summary>Advanced / diagnostics</summary>
+  <div class="card" style="margin-top:10px">
+    <table id="diagTable"></table>
+    <div class="nbtns" style="margin-top:12px">
+      <button class="sm" id="btnCopyDiag">Copy diagnostics</button>
+      <button class="sm" id="btnClrLog">Clear log</button>
+    </div>
+    <textarea id="log" readonly></textarea>
+  </div>
+</details>
+
+</div>
+
+<script>
+const NUS='6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const RXCH='6e400002-b5a3-f393-e0a9-e50e24dcca9e';
+const TXCH='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+
+const CPR4=10000, DEG=360/CPR4;
+
+/* ============================================================
+   INDEX CALIBRATION — one entry per AXIS of the rig, not per node.
+   The index pulse is a property of the code wheel and the reader
+   mounted on that axis, so these numbers stay valid when the
+   electronics are swapped for a spare.
+
+   Value = encoder counts from the arm hanging at rest to the index
+   position (0..9999). Measure once in Settings, then paste here so
+   every browser and phone that opens this file gets it.
+   ============================================================ */
+const AXIS_CALIBRATION={
+  base : {offset:null, invert:false},   // upper (center) axis, e.g. offset:3271
+  elbow: {offset:null, invert:false}    // lower (elbow) axis
+};
+const axisCal={base:Object.assign({},AXIS_CALIBRATION.base),
+               elbow:Object.assign({},AXIS_CALIBRATION.elbow)};
+try{
+  const st=JSON.parse(localStorage.getItem('axisCal')||'{}');
+  for(const k of ['base','elbow']){
+    if(!st[k]) continue;
+    if(Number.isFinite(st[k].offset)) axisCal[k].offset=st[k].offset;
+    if(typeof st[k].invert==='boolean') axisCal[k].invert=st[k].invert;
+  }
+}catch(e){}
+function saveAxisCal(){
+  try{ localStorage.setItem('axisCal',JSON.stringify(axisCal)); }catch(e){}
+}
+function axisSign(slot){ return axisCal[slot].invert ? -1 : 1; }
+const LIVE_MS=10, SPAN_MS=15000;
+const $=id=>document.getElementById(id);
+
+function logLine(m){
+  const l=$('log');
+  l.value=(l.value+new Date().toLocaleTimeString('en-GB')+'  '+m+'\n').slice(-6000);
+  l.scrollTop=l.scrollHeight;
+}
+
+/* ================= node model ================= */
+function makeNode(slot,title,cls){
+  return {slot,title,cls,
+    dev:null,rx:null,tx:null,name:'',nodeId:0,
+    state:0,vbat:0,samples:0,maxSamples:24000,inv:0,zerr:0,
+    rateA:0,rateB:0,zTotal:0,connInt:0,mtu:0,imuOk:0,imuStored:0,zMaxDev:0,
+    indexCount:null,calibRest:null,
+    count:0,zero:0,imu:[0,0,0,0,0,0],
+    trace:[],clockOffset:null,lastTick:null,
+    reg:{n:0,sx:0,sy:0,sxx:0,sxy:0},          // device ms -> epoch ms
+    recStartTick:null,recStartEpoch:null,
+    dump:null,textBuf:'',wq:Promise.resolve(),
+    lagMs:300,gaps:[],lastPktAt:0,pkts:[]};
+}
+const nodes={ base:makeNode('base','Upper (center) arm','c1'),
+              elbow:makeNode('elbow','Lower (elbow) arm','c2') };
+
+const lastDump={base:null,elbow:null};   // последние выгруженные записи для сведения
+
+function anyConnected(){ return !!(nodes.base.dev||nodes.elbow.dev); }
+function connectedNodes(){ return [nodes.base,nodes.elbow].filter(n=>n.dev); }
+function recording(){ return connectedNodes().some(n=>n.state===2); }
+
+/* ================= UI construction ================= */
+function buildCalibRows(){
+  const host=$('calibHost'); host.innerHTML='';
+  for(const key of ['base','elbow']){
+    const n=nodes[key];
+    const d=document.createElement('div');
+    d.className='row';
+    d.style.cssText='padding:9px 0;border-bottom:1px solid var(--line)';
+    d.innerHTML='<span style="min-width:150px">'+n.title+'</span>'+
+      '<b id="cst_'+key+'" style="flex:1;text-align:left">—</b>'+
+      '<label class="chk" style="margin-right:10px">'+
+        '<input type="checkbox" id="inv_'+key+'"> reverse</label>'+
+      '<button class="sm" id="cal_'+key+'" disabled>Measure</button> '+
+      '<button class="sm" id="calclr_'+key+'" disabled>Clear</button>';
+    host.appendChild(d);
+    $('cal_'+key).onclick=()=>{
+      if(!n.dev) return;
+      if(!confirm('Let the '+n.title.toLowerCase()+' hang still at its resting '+
+                  'position. After pressing OK, turn it slowly through at least '+
+                  'one full revolution.')) return;
+      n.calibRest=n.count;
+      logLine(n.slot+' axis: measuring — now turn the arm through the index');
+    };
+    $('inv_'+key).checked=axisCal[key].invert;
+    $('inv_'+key).onchange=()=>{
+      axisCal[key].invert=$('inv_'+key).checked;
+      saveAxisCal(); clearTrails();
+      logLine(key+' axis: rotation direction '+(axisCal[key].invert?'reversed':'normal'));
+    };
+    $('calclr_'+key).onclick=()=>{
+      if(!confirm('Erase the stored index offset for this axis?')) return;
+      axisCal[key].offset=null; saveAxisCal(); logLine(key+' axis: calibration cleared');
+    };
+  }
+}
+
+function calLineForFile(){
+  const f=k=>'{offset:'+(Number.isFinite(axisCal[k].offset)?axisCal[k].offset:'null')+
+             ', invert:'+(axisCal[k].invert?'true':'false')+'}';
+  return 'const AXIS_CALIBRATION={\n'+
+         '  base : '+f('base')+',\n'+
+         '  elbow: '+f('elbow')+'\n};';
+}
+
+function buildNodeCards(){
+  const host=$('nodes'); host.innerHTML='';
+  for(const key of ['base','elbow']){
+    const n=nodes[key];
+    const d=document.createElement('div');
+    d.className='node'; d.id='card_'+key;
+    d.innerHTML=
+      '<div class="nhead"><i class="dot" id="dot_'+key+'"></i>'+
+      '<b>'+n.title+'</b><span class="tag '+n.cls+'" id="tag_'+key+'">not connected</span></div>'+
+      '<div class="row"><span>Angle</span><b id="ang_'+key+'">—</b></div>'+
+      '<div class="row"><span>Battery</span><b id="bat_'+key+'">—</b></div>'+
+      '<div class="bar"><i id="batbar_'+key+'"></i></div>'+
+      '<div class="row"><span>Recorded</span><b id="smp_'+key+'">—</b></div>'+
+      '<div class="bar"><i id="smpbar_'+key+'"></i></div>'+
+      '<div class="row"><span>Gyro / accel</span><b id="imu_'+key+'">—</b></div>'+
+      '<div class="row"><span>Integrity</span><b id="int_'+key+'">—</b></div>'+
+      '<div class="row"><span>Index check</span><b id="idx_'+key+'">—</b></div>'+
+      '<div class="nbtns">'+
+        '<button class="sm" id="conn_'+key+'">Connect</button>'+
+        '<button class="sm" id="zero_'+key+'" disabled>Set zero</button>'+
+        '<button class="sm" id="disc_'+key+'" disabled>Disconnect</button>'+
+      '</div>';
+    host.appendChild(d);
+    $('conn_'+key).onclick=()=>connect(n);
+    $('disc_'+key).onclick=()=>n.dev&&n.dev.gatt.disconnect();
+    $('zero_'+key).onclick=()=>{ n.zero=n.count; n.trace.length=0; clearTrails(); };
+  }
+}
+
+/* ================= BLE ================= */
+function send(n,s){
+  n.wq=n.wq.then(async()=>{ if(n.rx) await n.rx.writeValue(new TextEncoder().encode(s+'\n')); })
+           .catch(e=>logLine(n.slot+' command failed: '+e.message));
+  return n.wq;
+}
+
+async function connect(n){
+  try{
+    const dev=await navigator.bluetooth.requestDevice({
+      filters:[{namePrefix:'DP-'}], optionalServices:[NUS]});
+    n.dev=dev;
+    dev.addEventListener('gattserverdisconnected',()=>onDisc(n));
+    const srv=await dev.gatt.connect();
+    const svc=await srv.getPrimaryService(NUS);
+    n.rx=await svc.getCharacteristic(RXCH);
+    n.tx=await svc.getCharacteristic(TXCH);
+    await n.tx.startNotifications();
+    n.tx.addEventListener('characteristicvaluechanged',e=>onData(n,e));
+    n.name=dev.name||'device';
+    n.trace.length=0; n.clockOffset=null; n.lastTick=null;
+    n.reg={n:0,sx:0,sy:0,sxx:0,sxy:0}; n.gaps=[]; n.pkts=[]; n.lastPktAt=0;
+    logLine(n.slot+': connected to '+n.name);
+    send(n,'S');
+  }catch(e){ logLine('connect failed: '+e.message); }
+}
+
+function onDisc(n){
+  n.dev=null; n.rx=null; n.tx=null; n.state=0; n.vbat=0;
+  logLine(n.slot+': disconnected');
+}
+
+function onData(n,e){
+  const bytes=new Uint8Array(e.target.value.buffer);
+  if(n.dump && (n.dump.mode==='bin'||n.dump.mode==='bin2')){ feedBinary(n,bytes); return; }
+  n.textBuf+=new TextDecoder().decode(bytes);
+  if(!n.dump && n.textBuf.length>300 && n.textBuf.indexOf('\n')<0){
+    n.textBuf=n.textBuf.replace(/(?!^)(?=L,|I,|T,|STATUS,|OK,|ERR,)/g,'\n');
+  }
+  let i;
+  while((i=n.textBuf.indexOf('\n'))>=0){
+    const line=n.textBuf.slice(0,i).trim();
+    n.textBuf=n.textBuf.slice(i+1);
+    if(line) handleLine(n,line);
+    if(n.dump && (n.dump.mode==='bin'||n.dump.mode==='bin2')){
+      const rest=new TextEncoder().encode(n.textBuf);
+      n.textBuf='';
+      if(rest.length) feedBinary(n,rest);
+      return;
+    }
+  }
+  if(n.textBuf.length>4000) n.textBuf='';
+}
+
+function nums(p,from,howMany){
+  const out=[];
+  for(let i=from;i<from+howMany;i++){
+    const v=Number(p[i]);
+    if(!Number.isFinite(v)) return null;
+    out.push(v);
+  }
+  return out;
+}
+
+function epochNow(){ return performance.timeOrigin+performance.now(); }
+
+function handleLine(n,line){
+  const p=line.split(',');
+
+  if(p[0]==='L'){
+    const tick0=Number(p[1]);
+    if(!Number.isFinite(tick0)||p.length<3) return;
+    const nowP=performance.now();
+    n.pkts.push(nowP);
+    if(n.lastPktAt) n.gaps.push({t:nowP,g:nowP-n.lastPktAt});
+    n.lastPktAt=nowP;
+
+    let c=null;
+    for(let i=2;i<p.length;i++){
+      const v=Number(p[i]);
+      if(!Number.isFinite(v)) return;
+      c=(i===2)?v:c+v;
+      n.trace.push({t:(tick0+(i-2))*LIVE_MS,c:c});
+      n.lastTick=tick0+(i-2);
+    }
+    n.count=c;
+
+    // привязка часов прибора к часам браузера
+    const devMs=n.lastTick*LIVE_MS;
+    const off=devMs-performance.now();
+    if(n.clockOffset===null) n.clockOffset=off;
+    else n.clockOffset+=(off-n.clockOffset)*0.03;
+    const r=n.reg, y=epochNow();
+    r.n++; r.sx+=devMs; r.sy+=y; r.sxx+=devMs*devMs; r.sxy+=devMs*y;
+
+    const cut=devMs-SPAN_MS-3000;
+    while(n.trace.length && n.trace[0].t<cut) n.trace.shift();
+    return;
+  }
+
+  if(p[0]==='Zv'){                      // прошёл индекс
+    const v=nums(p,1,2);
+    if(!v) return;
+    n.indexCount=v[0];
+    if(n.calibRest!==null){             // идёт измерение калибровки
+      let off=(v[0]-n.calibRest)%CPR4;
+      if(off<0) off+=CPR4;
+      axisCal[n.slot].offset=off; saveAxisCal(); n.calibRest=null;
+      logLine(n.slot+' axis: index offset measured = '+off+' counts ('+
+              (off*DEG).toFixed(2)+'\u00B0)');
+    }
+    return;
+  }
+
+  if(p[0]==='I'){
+    const v=nums(p,2,6);
+    if(v) n.imu=v;
+    return;
+  }
+
+  if(p[0]==='T'){
+    const v=nums(p,1,9);
+    if(!v) return;
+    n.count=v[0]; n.vbat=v[1]; n.state=v[2]; n.samples=v[3];
+    n.inv=v[4]; n.zerr=v[5]; n.rateA=v[6]; n.rateB=v[7]; n.zTotal=v[8];
+    if(p.length>=12){ const e2=nums(p,10,2); if(e2){ n.connInt=e2[0]; n.mtu=e2[1]; } }
+    if(p.length>=13){ const e3=Number(p[12]); if(Number.isFinite(e3)) n.imuOk=e3; }
+    if(p.length>=14){ const e4=Number(p[13]); if(Number.isFinite(e4)) n.zMaxDev=e4; }
+    return;
+  }
+
+  if(p[0]==='STATUS'){
+    const v=nums(p,2,9);
+    if(!v) return;
+    n.name=p[1]; n.state=v[0]; n.vbat=v[1]; n.samples=v[2]; n.maxSamples=v[3];
+    n.inv=v[5]; n.zerr=v[6]; n.zTotal=v[7]; n.count=v[8];
+    if(p.length>=13){ const e2=nums(p,11,2); if(e2){ n.connInt=e2[0]; n.mtu=e2[1]; } }
+    if(p.length>=15){ const e3=nums(p,13,2); if(e3){ n.nodeId=e3[0]; n.imuStored=e3[1]; } }
+    if(p.length>=16){ const e4=Number(p[15]); if(Number.isFinite(e4)) n.indexCount=e4; }
+    return;
+  }
+
+  if(p[0]==='OK'){
+    if(p[1]==='rec'){
+      n.recStartTick=Number(p[3]);            // тик 1 кГц = мс прибора
+      n.recStartEpoch=epochNow();             // грубая привязка на случай отсутствия регрессии
+      logLine(n.slot+': recording started @'+p[2]+' Hz');
+    } else logLine(n.slot+': '+line);
+    send(n,'S');
+    return;
+  }
+  if(p[0]==='ERR'){ logLine(n.slot+' error: '+line); n.dump=null; return; }
+
+  if(p[0]==='DUMP'){
+    const v=nums(p,1,6);
+    if(!v){ logLine('bad dump header'); return; }
+    n.dump={mode:'hdr',n:v[0],rate:v[1],start:v[2],vbat:v[3],inv:v[4],zerr:v[5],
+            startTick:Number(p[7]),
+            zMaxDev:Number(p[8])||0, zPasses:Number(p[9])||0,
+            zeroValid:Number(p[10])||0, zeroCount:Number(p[11])||0,
+            z:[],data:new Int16Array(v[0]),got:0,
+            buf:new Uint8Array(0),imuN:0,imuRate:50,imuData:null,imuGot:0};
+    logLine(n.slot+': downloading '+v[0]+' samples');
+    return;
+  }
+  if(p[0]==='Z'&&n.dump){ const v=nums(p,1,2); if(v) n.dump.z.push(v); return; }
+  if(p[0]==='BIN'&&n.dump){ n.dump.mode='bin'; return; }
+  if(p[0]==='IMU'&&n.dump){
+    const v=nums(p,1,2);
+    if(v){ n.dump.imuN=v[0]; n.dump.imuRate=v[1];
+           n.dump.imuData=new Int16Array(v[0]*6); }
+    if(!v||v[0]===0) n.dump.mode='tail';
+    return;
+  }
+  if(p[0]==='IBIN'&&n.dump){ n.dump.mode='bin2'; return; }
+  if(p[0]==='END'){ finishDump(n); return; }
+}
+
+function feedBinary(n,bytes){
+  const d=n.dump;
+  const m=new Uint8Array(d.buf.length+bytes.length);
+  m.set(d.buf); m.set(bytes,d.buf.length);
+  d.buf=m;
+  const isImu=(d.mode==='bin2');
+  let off=0;
+  while(d.buf.length-off>=8){
+    if(d.buf[off]!==0xA5||d.buf[off+1]!==0x5A){ off++; continue; }
+    const len=d.buf[off+4]|(d.buf[off+5]<<8);
+    if(d.buf.length-off<8+len) break;
+    const seq=d.buf[off+2]|(d.buf[off+3]<<8);
+    let sum=0;
+    for(let i=0;i<len;i++) sum=(sum+d.buf[off+6+i])&0xFFFF;
+    const chk=d.buf[off+6+len]|(d.buf[off+7+len]<<8);
+    if(sum===chk){
+      if(isImu){
+        const base=seq*20*6;
+        for(let i=0;i<len/2;i++){
+          let v=d.buf[off+6+i*2]|(d.buf[off+7+i*2]<<8);
+          if(v>32767) v-=65536;
+          if(base+i<d.imuData.length){ d.imuData[base+i]=v; d.imuGot++; }
+        }
+      }else{
+        const base=seq*100;
+        for(let i=0;i<len/2;i++){
+          let v=d.buf[off+6+i*2]|(d.buf[off+7+i*2]<<8);
+          if(v>32767) v-=65536;
+          if(base+i<d.n){ d.data[base+i]=v; d.got++; }
+        }
+      }
+    } else logLine('chunk '+seq+': checksum mismatch');
+    off+=8+len;
+
+    const done = isImu ? (d.imuGot>=d.imuN*6) : (d.got>=d.n);
+    if(done){
+      d.mode='tail';
+      const rest=d.buf.slice(off);
+      d.buf=new Uint8Array(0);
+      n.textBuf+=new TextDecoder().decode(rest);
+      let i;
+      while((i=n.textBuf.indexOf('\n'))>=0){
+        const l=n.textBuf.slice(0,i).trim(); n.textBuf=n.textBuf.slice(i+1);
+        if(l) handleLine(n,l);
+        if(n.dump && n.dump.mode==='bin2'){
+          const r2=new TextEncoder().encode(n.textBuf); n.textBuf='';
+          if(r2.length) feedBinary(n,r2);
+          return;
+        }
+      }
+      return;
+    }
+  }
+  d.buf=d.buf.slice(off);
+}
+
+/* привязка времени прибора к абсолютному времени по накопленной регрессии */
+function deviceMsToEpoch(n,devMs){
+  const r=n.reg;
+  if(r.n>=20){
+    const den=r.n*r.sxx-r.sx*r.sx;
+    if(Math.abs(den)>1e-6){
+      const a=(r.n*r.sxy-r.sx*r.sy)/den;      // наклон (эпоха/тик)
+      const b=(r.sy-a*r.sx)/r.n;
+      return {epoch:a*devMs+b, ppm:(a-1)*1e6, ok:true};
+    }
+  }
+  return {epoch:n.recStartEpoch||epochNow(), ppm:0, ok:false};
+}
+
+function saveCsv(name,text){
+  const blob=new Blob([text],{type:'text/csv'});
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(blob);
+  a.download=name; a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function finishDump(n){
+  const d=n.dump; if(!d) return;
+  n.dump=null;
+  if(d.got<d.n){ logLine(n.slot+': got '+d.got+' of '+d.n+' — retry'); return; }
+
+  const map=deviceMsToEpoch(n,d.startTick);
+  const startIso=new Date(map.epoch).toISOString();
+  const stamp=new Date(map.epoch).toISOString().slice(0,19).replace(/[:T]/g,'-');
+  const head=[
+    '# device: '+n.name+'   role: '+n.slot,
+    '# start_time_utc: '+startIso+(map.ok?'':'  (approximate: not enough clock samples)'),
+    '# clock_drift_ppm: '+map.ppm.toFixed(0),
+    '# sample_rate_hz: '+d.rate+'   samples: '+d.n,
+    '# counts_per_rev: '+CPR4+' (CPR 2500, quadrature x4)',
+    '# battery_v: '+(d.vbat/1000).toFixed(2),
+    '# quadrature_errors: '+d.inv+'   index_errors: '+d.zerr,
+    '# index_verification: '+((d.inv+d.zerr)===0?'PASSED':'FAILED'),
+    '# index_passes: '+d.zPasses+'   worst_index_mismatch_counts: '+d.zMaxDev+
+      '  ('+(d.zMaxDev*DEG).toFixed(3)+' deg)',
+    '# zero_reference: '+(Number.isFinite(axisCal[n.slot].offset)&&n.indexCount!==null
+        ? ('index pulse, axis offset '+axisCal[n.slot].offset+' counts, zero at count '+
+           (n.indexCount-axisCal[n.slot].offset))
+        : 'manual / not set'),
+    '# rotation_sign: '+axisSign(n.slot)+
+      '   (counts column is raw from the encoder; deg = (counts - zero) * '+
+      DEG.toFixed(4)+' * sign)'
+  ];
+  for(const [idx,c] of d.z) head.push('# z_index_at_sample: '+idx+'  count: '+c);
+
+  const L=head.slice();
+  L.push('t,counts,deg');
+  let acc=d.start;
+  for(let i=0;i<d.n;i++){
+    acc+=d.data[i];
+    L.push((i/d.rate).toFixed(4)+','+acc+','+degOf(n,acc).toFixed(3));
+  }
+  saveCsv('pendulum_'+n.slot+'_'+stamp+'_encoder.csv',L.join('\n'));
+
+  if(d.imuN>0 && d.imuData){
+    const I=head.slice();
+    I.push('# imu_rate_hz: '+d.imuRate+'   imu_samples: '+d.imuN);
+    I.push('# units: acc in mg, gyro in 0.1 deg/s');
+    I.push('t,ax,ay,az,gx,gy,gz');
+    for(let i=0;i<d.imuN;i++){
+      const b=i*6;
+      I.push((i/d.imuRate).toFixed(4)+','+d.imuData[b]+','+d.imuData[b+1]+','+
+             d.imuData[b+2]+','+d.imuData[b+3]+','+d.imuData[b+4]+','+d.imuData[b+5]);
+    }
+    saveCsv('pendulum_'+n.slot+'_'+stamp+'_imu.csv',I.join('\n'));
+  }
+  // сохраняем для сведения двух приборов по общему старту движения
+  const counts=new Float64Array(d.n);
+  let a2=d.start;
+  for(let i=0;i<d.n;i++){ a2+=d.data[i]; counts[i]=a2; }
+  lastDump[n.slot]={rate:d.rate,counts:counts,ppm:map.ppm,
+                    startEpoch:map.epoch,device:n.name,stamp:stamp};
+  logLine(n.slot+': saved '+d.n+' encoder + '+d.imuN+' imu samples');
+}
+
+/* ---- сведение двух записей по моменту начала движения ---- */
+function firstMotionIndex(counts){
+  const base=counts[0];
+  const THRESH=5;                      // отсчётов энкодера = 0.18 град
+  for(let i=1;i<counts.length;i++){
+    if(Math.abs(counts[i]-base)>=THRESH){
+      // уточнение: возвращаемся к последнему неподвижному отсчёту
+      let j=i;
+      while(j>1 && Math.abs(counts[j-1]-base)>0.5) j--;
+      return j-1;
+    }
+  }
+  return -1;
+}
+
+function restLevel(counts,i0){
+  let s=0,k=0;
+  for(let i=Math.max(0,i0-20);i<=i0;i++){ s+=counts[i]; k++; }
+  return k?s/k:counts[0];
+}
+
+function interpAt(counts,rate,t){
+  const x=t*rate;
+  if(x<=0) return counts[0];
+  if(x>=counts.length-1) return counts[counts.length-1];
+  const i=Math.floor(x), f=x-i;
+  return counts[i]+(counts[i+1]-counts[i])*f;
+}
+
+function mergeAndSave(){
+  const A=lastDump.base, B=lastDump.elbow;
+  if(!A||!B){ logLine('need a finished recording from both sensors'); return; }
+
+  const iA=firstMotionIndex(A.counts), iB=firstMotionIndex(B.counts);
+  if(iA<0||iB<0){
+    logLine('no clear start of motion found — release the pendulum from rest '+
+            'AFTER pressing Record, otherwise the two files cannot be aligned');
+    return;
+  }
+
+  // поправка хода каждого прибора относительно часов браузера
+  const kA=1+A.ppm/1e6, kB=1+B.ppm/1e6;
+  const restA=restLevel(A.counts,iA), restB=restLevel(B.counts,iB);
+
+  const durA=(A.counts.length-1-iA)/A.rate*kA;
+  const durB=(B.counts.length-1-iB)/B.rate*kB;
+  const dur=Math.min(durA,durB);
+  const rate=Math.max(A.rate,B.rate);
+  const n=Math.floor(dur*rate);
+  if(n<10){ logLine('recordings do not overlap after alignment'); return; }
+
+  const L=[];
+  L.push('# aligned double pendulum data');
+  L.push('# upper: '+A.device+'   lower: '+B.device);
+  L.push('# t = 0 at the start of motion (release), found independently in each file');
+  L.push('# alignment residual: about one sample of the slower stream');
+  L.push('# clock drift removed: upper '+A.ppm.toFixed(0)+' ppm, lower '+B.ppm.toFixed(0)+' ppm');
+  L.push('# angles are relative to the resting position of each arm');
+  L.push('# rotation sign: upper '+axisSign('base')+', lower '+axisSign('elbow'));
+  L.push('# lower angle is '+($('relMode').checked?'relative to the upper arm':'absolute')+
+         ' as configured in the console');
+  L.push('t,deg_upper,deg_lower,counts_upper,counts_lower');
+
+  for(let i=0;i<n;i++){
+    const t=i/rate;
+    const ca=interpAt(A.counts,A.rate,t/kA+iA/A.rate);
+    const cb=interpAt(B.counts,B.rate,t/kB+iB/B.rate);
+    L.push(t.toFixed(4)+','+
+           ((ca-restA)*DEG*axisSign('base')).toFixed(3)+','+
+           ((cb-restB)*DEG*axisSign('elbow')).toFixed(3)+','+
+           ca.toFixed(1)+','+cb.toFixed(1));
+  }
+  saveCsv('pendulum_aligned_'+A.stamp+'.csv',L.join('\n'));
+  logLine('aligned file saved: '+n+' rows @'+rate+' Hz');
+}
+
+/* ================= drawing ================= */
+function zeroRef(n){
+  // ноль от индекса: смещение принадлежит оси, положение индекса берём
+  // из последнего его прохода — поэтому ноль обновляется сам каждый оборот
+  const off=axisCal[n.slot].offset;
+  if($('useIdxZero').checked && Number.isFinite(off) && n.indexCount!==null)
+    return n.indexCount-off;
+  return n.zero;
+}
+// направление вращения зависит от того, как считыватель стоит относительно
+// диска: это свойство оси, поэтому знак хранится вместе с калибровкой
+function degOf(n,rawCount){ return (rawCount-zeroRef(n))*DEG*axisSign(n.slot); }
+function angleOf(n){ return degOf(n,n.count); }
+
+function traceAt(n,tms){
+  const tr=n.trace;
+  if(!tr.length) return null;
+  if(tms<=tr[0].t) return tr[0].c;
+  if(tms>=tr[tr.length-1].t) return tr[tr.length-1].c;
+  let lo=0,hi=tr.length-1;
+  while(hi-lo>1){ const m=(lo+hi)>>1; (tr[m].t<=tms)?lo=m:hi=m; }
+  const a=tr[lo],b=tr[hi],k=(tms-a.t)/(b.t-a.t||1);
+  return a.c+(b.c-a.c)*k;
+}
+
+let shown1=0, shown2=0;
+const trail1=[], trail2=[];            // след локтя и след кончика
+
+function clearTrails(){ trail1.length=0; trail2.length=0; }
+
+// polyline с плавным затуханием: старые куски бледнее
+function trailPath(pts,color){
+  if(pts.length<2) return '';
+  const CH=8, out=[];
+  const seg=Math.ceil(pts.length/CH);
+  for(let c=0;c<CH;c++){
+    const a=c*seg, b=Math.min(pts.length,(c+1)*seg+1);
+    if(b-a<2) continue;
+    const d=[];
+    for(let i=a;i<b;i++) d.push(pts[i][0].toFixed(1)+','+pts[i][1].toFixed(1));
+    const op=(0.08+0.62*(c+1)/CH).toFixed(3);
+    out.push('<polyline points="'+d.join(' ')+'" fill="none" stroke="'+color+
+             '" stroke-width="1.6" stroke-opacity="'+op+'" stroke-linecap="round"/>');
+  }
+  return out.join('');
+}
+
+function drawStage(){
+  const s=$('stage');
+  const cx=260, cy=110, L1=110, L2=110;
+  const on1=!!nodes.base.dev, on2=!!nodes.elbow.dev;
+  const t1=shown1*Math.PI/180;
+  const t2abs=($('relMode').checked ? shown1+shown2 : shown2)*Math.PI/180;
+  const x1=cx+L1*Math.sin(t1), y1=cy+L1*Math.cos(t1);
+  const x2=x1+L2*Math.sin(t2abs), y2=y1+L2*Math.cos(t2abs);
+
+  const c1=on1?'#4da3ff':'#39424c', c2=on2?'#ffb454':'#39424c';
+
+  if($('trails').checked){
+    const lim=+$('trailLen').value||0;
+    trail1.push([x1,y1]); trail2.push([x2,y2]);
+    if(lim>0){
+      while(trail1.length>lim) trail1.shift();
+      while(trail2.length>lim) trail2.shift();
+    } else if(trail1.length>20000){ trail1.shift(); trail2.shift(); }
+  }
+  let h='';
+  h+='<line x1="0" y1="'+cy+'" x2="520" y2="'+cy+'" stroke="#252d36" stroke-width="1"/>';
+  h+='<line x1="'+cx+'" y1="'+cy+'" x2="'+cx+'" y2="'+(cy+L1+L2+30)+
+     '" stroke="#1e252d" stroke-width="1" stroke-dasharray="4 5"/>';
+  if($('trails').checked){
+    if(on1) h+=trailPath(trail1,'#4da3ff');
+    if(on2) h+=trailPath(trail2,'#ffb454');
+  }
+  // верхнее звено
+  h+='<line x1="'+cx+'" y1="'+cy+'" x2="'+x1.toFixed(1)+'" y2="'+y1.toFixed(1)+
+     '" stroke="'+c1+'" stroke-width="7" stroke-linecap="round"/>';
+  // нижнее звено
+  h+='<line x1="'+x1.toFixed(1)+'" y1="'+y1.toFixed(1)+'" x2="'+x2.toFixed(1)+
+     '" y2="'+y2.toFixed(1)+'" stroke="'+c2+'" stroke-width="7" stroke-linecap="round"/>';
+  h+='<circle cx="'+x1.toFixed(1)+'" cy="'+y1.toFixed(1)+'" r="9" fill="#171c22" stroke="'+c1+'" stroke-width="3"/>';
+  h+='<circle cx="'+x2.toFixed(1)+'" cy="'+y2.toFixed(1)+'" r="11" fill="'+c2+'" opacity="'+(on2?1:.45)+'"/>';
+  h+='<circle cx="'+cx+'" cy="'+cy+'" r="10" fill="#171c22" stroke="#4a5765" stroke-width="3"/>';
+  if(!on1) h+='<text x="'+(cx+16)+'" y="'+(cy+40)+'" fill="#5a6672" font-size="12" font-family="ui-monospace,monospace">upper sensor not connected</text>';
+  if(!on2) h+='<text x="'+(x1+16).toFixed(1)+'" y="'+(y1+50).toFixed(1)+'" fill="#5a6672" font-size="12" font-family="ui-monospace,monospace">lower sensor not connected</text>';
+  s.innerHTML=h;
+}
+
+function drawChart(){
+  const c=$('chart'),dpr=devicePixelRatio||1;
+  const w=c.clientWidth,h=240;
+  if(c.width!==Math.round(w*dpr)){ c.width=Math.round(w*dpr); c.height=Math.round(h*dpr); }
+  const g=c.getContext('2d');
+  g.setTransform(dpr,0,0,dpr,0,0);
+  g.fillStyle='#0c1015'; g.fillRect(0,0,w,h);
+  g.strokeStyle='#1e252d'; g.lineWidth=1;
+  for(let i=1;i<4;i++){const y=h*i/4;g.beginPath();g.moveTo(0,y);g.lineTo(w,y);g.stroke();}
+
+  const series=[];
+  for(const n of connectedNodes()){
+    if(n.clockOffset===null||n.trace.length<2) continue;
+    const tEnd=performance.now()+n.clockOffset-n.lagMs;
+    series.push({n,tEnd,color:n.slot==='base'?'#4da3ff':'#ffb454'});
+  }
+  if(!series.length) return;
+
+  let lo=Infinity,hi=-Infinity;
+  for(const s of series){
+    for(const p of s.n.trace){
+      if(p.t>=s.tEnd-SPAN_MS&&p.t<=s.tEnd){
+        const d=degOf(s.n,p.c);
+        if(d<lo)lo=d; if(d>hi)hi=d;
+      }
+    }
+  }
+  if(!isFinite(lo)) return;
+  if(hi-lo<20){const m=(hi+lo)/2;lo=m-10;hi=m+10;}
+  const pad=(hi-lo)*0.12; lo-=pad; hi+=pad;
+
+  for(const s of series){
+    g.strokeStyle=s.color; g.lineWidth=2; g.lineJoin='round'; g.beginPath();
+    let started=false;
+    for(const p of s.n.trace){
+      if(p.t<s.tEnd-SPAN_MS||p.t>s.tEnd) continue;
+      const x=w*(p.t-(s.tEnd-SPAN_MS))/SPAN_MS;
+      const y=h-(degOf(s.n,p.c)-lo)/(hi-lo)*h;
+      started?g.lineTo(x,y):(g.moveTo(x,y),started=true);
+    }
+    g.stroke();
+  }
+  g.fillStyle='#8b98a5'; g.font='11px ui-monospace,monospace';
+  g.fillText(hi.toFixed(0)+'\u00B0',6,14);
+  g.fillText(lo.toFixed(0)+'\u00B0',6,h-6);
+  g.fillText((SPAN_MS/1000)+' s',w-30,h-6);
+}
+
+function batPct(mv){
+  const t=[[4150,100],[4000,85],[3850,65],[3750,50],[3650,35],[3550,20],[3450,10],[3300,3]];
+  for(const [v,p] of t) if(mv>=v) return p;
+  return 0;
+}
+function setText(id,v){const e=$(id); if(e&&e.textContent!==v) e.textContent=v;}
+
+function refreshNode(key){
+  const n=nodes[key], on=!!n.dev;
+  $('card_'+key).className='node'+(on?' on':'');
+  $('tag_'+key).textContent = on ? (n.name||'connected') : 'not connected';
+  const dot=$('dot_'+key);
+  const dc='dot'+(n.state===2?' rc':n.state===1?' on':'');
+  if(dot.className!==dc) dot.className=dc;
+
+  setText('ang_'+key, on ? angleOf(n).toFixed(1)+'\u00B0' : '—');
+
+  if(on&&n.vbat>2000){
+    const p=batPct(n.vbat);
+    setText('bat_'+key,(n.vbat/1000).toFixed(2)+' V · '+p+'%');
+    const b=$('batbar_'+key); b.style.width=p+'%';
+    b.className = p>50?'':p>20?'w':'r';
+  } else setText('bat_'+key,'—');
+
+  const rate=+$('rate').value||200;
+  setText('smp_'+key, on ? n.samples.toLocaleString('en-US')+' ('+(n.samples/rate).toFixed(1)+' s)' : '—');
+  const fill=n.maxSamples?n.samples/n.maxSamples*100:0;
+  $('smpbar_'+key).style.width=Math.min(100,fill)+'%';
+  $('smpbar_'+key).className = fill>90?'r':fill>70?'w':'';
+
+  if(on){
+    const gz=(n.imu[5]/10).toFixed(0);
+    const am=Math.round(Math.hypot(n.imu[0],n.imu[1],n.imu[2]));
+    setText('imu_'+key, n.imuOk||n.imu.some(v=>v!==0) ? gz+'\u00B0/s · '+am+' mg' : 'no imu');
+  } else setText('imu_'+key,'—');
+
+  const ie=$('int_'+key);
+  if(!on){ setText('int_'+key,'—'); ie.style.color=''; }
+  else if(n.inv+n.zerr===0){ setText('int_'+key,'clean'); ie.style.color='var(--ok)'; }
+  else { setText('int_'+key,'inv='+n.inv+' zerr='+n.zerr); ie.style.color='var(--err)'; }
+
+  const ix=$('idx_'+key);
+  if(!on){ setText('idx_'+key,'—'); ix.style.color=''; }
+  else if(n.zTotal===0){ setText('idx_'+key,'no full turn yet'); ix.style.color='var(--dim)'; }
+  else if(n.zMaxDev===0){ setText('idx_'+key,n.zTotal+' turns · exact'); ix.style.color='var(--ok)'; }
+  else {
+    setText('idx_'+key, n.zTotal+' turns · off by '+n.zMaxDev+' ('+(n.zMaxDev*DEG).toFixed(2)+'\u00B0)');
+    ix.style.color = n.zMaxDev>3 ? 'var(--err)' : 'var(--warn)';
+  }
+
+  $('conn_'+key).disabled=on;
+  $('disc_'+key).disabled=!on;
+  $('zero_'+key).disabled=!on;
+}
+
+function refreshCalib(){
+  for(const key of ['base','elbow']){
+    const n=nodes[key], on=!!n.dev, off=axisCal[key].offset;
+    const e=$('cst_'+key);
+    if(!e) continue;
+    let t, c;
+    if(n.calibRest!==null){ t='measuring — turn the arm through the index'; c='var(--acc)'; }
+    else if(!Number.isFinite(off)){ t='axis not calibrated'; c='var(--dim)'; }
+    else if(!on){ t='offset '+off+' counts ('+(off*DEG).toFixed(2)+'\u00B0)'; c='var(--dim)'; }
+    else if(n.indexCount===null){
+      t='offset '+off+' counts · waiting for the index to pass'; c='var(--warn)'; }
+    else { t='offset '+off+' counts · zero locked to index'; c='var(--ok)'; }
+    e.textContent=t; e.style.color=c;
+    $('cal_'+key).disabled=!on||n.state===2;
+    $('calclr_'+key).disabled=!Number.isFinite(off)||n.state===2;
+  }
+  const box=$('calCode');
+  if(box) box.value=calLineForFile();
+}
+
+function refreshDiag(){
+  const t=$('diagTable');
+  let h='';
+  for(const key of ['base','elbow']){
+    const n=nodes[key];
+    if(!n.dev) continue;
+    const nowP=performance.now();
+    while(n.gaps.length&&n.gaps[0].t<nowP-5000) n.gaps.shift();
+    while(n.pkts.length&&n.pkts[0]<nowP-2000) n.pkts.shift();
+    let gmax=0; for(const g of n.gaps) if(g.g>gmax) gmax=g.g;
+    n.lagMs+= (Math.min(900,Math.max(250,gmax*1.8))-n.lagMs)*0.02;
+    const map=deviceMsToEpoch(n,0);
+    h+='<tr><td>'+n.slot+' · '+n.name+'</td><td>'+
+       'conn '+(n.connInt?(n.connInt*1.25).toFixed(1)+' ms':'?')+
+       ' · mtu '+(n.mtu||'?')+
+       ' · pkt '+Math.round(n.pkts.length/2)+'/s'+
+       ' · gap '+gmax.toFixed(0)+' ms'+
+       ' · lag '+n.lagMs.toFixed(0)+' ms'+
+       ' · edges A'+n.rateA+'/B'+n.rateB+
+       ' · Z '+n.zTotal+
+       ' · drift '+(map.ok?map.ppm.toFixed(0)+' ppm':'n/a')+
+       '</td></tr>';
+  }
+  t.innerHTML=h||'<tr><td>no sensors connected</td><td></td></tr>';
+}
+
+let diagTick=0;
+function render(){
+  requestAnimationFrame(render);
+
+  for(const key of ['base','elbow']){
+    const n=nodes[key];
+    let target=angleOf(n);
+    if(n.dev&&n.clockOffset!==null){
+      const v=traceAt(n,performance.now()+n.clockOffset-n.lagMs);
+      if(v!==null) target=degOf(n,v);
+    }
+    if(key==='base') shown1+=(target-shown1)*0.3;
+    else             shown2+=(target-shown2)*0.3;
+  }
+
+  setText('th1', nodes.base.dev ? shown1.toFixed(1)+'\u00B0' : '—');
+  setText('th2', nodes.elbow.dev ? shown2.toFixed(1)+'\u00B0' : '—');
+
+  drawStage();
+  drawChart();
+  refreshNode('base'); refreshNode('elbow');
+
+  const conn=anyConnected(), rec=recording();
+  $('btnRec').disabled=!conn||rec;
+  $('btnStop').disabled=!rec;
+  $('btnDl').disabled=!conn||rec||!connectedNodes().some(n=>n.samples>0);
+  $('btnMerge').disabled=!(lastDump.base&&lastDump.elbow);
+
+  if(++diagTick%15===0) refreshCalib();
+  if(diagTick%30===0) refreshDiag();
+}
+
+/* ================= actions ================= */
+$('btnRec').onclick=()=>{
+  const hz=$('rate').value;
+  lastDump.base=null; lastDump.elbow=null; clearTrails();
+  for(const n of connectedNodes()){ n.trace.length=0; send(n,'R,'+hz); }
+};
+$('btnStop').onclick=()=>{ for(const n of connectedNodes()) send(n,'E'); };
+$('btnDl').onclick=()=>{
+  for(const n of connectedNodes()) if(n.samples>0) send(n,'D');
+};
+$('btnCopyCal').onclick=async()=>{
+  try{ await navigator.clipboard.writeText(calLineForFile()); logLine('calibration block copied'); }
+  catch(e){ $('calCode').select(); logLine('press Ctrl+C to copy'); }
+};
+$('btnTrailClr').onclick=clearTrails;
+$('relMode').onchange=clearTrails;
+$('trails').onchange=clearTrails;
+$('btnMerge').onclick=mergeAndSave;
+$('btnClrLog').onclick=()=>{ $('log').value=''; };
+$('btnCopyDiag').onclick=async()=>{
+  refreshDiag();
+  const txt=$('diagTable').innerText+'\n\n'+$('log').value;
+  try{ await navigator.clipboard.writeText(txt); logLine('diagnostics copied'); }
+  catch(e){ $('log').select(); logLine('press Ctrl+C to copy'); }
+};
+
+if(!navigator.bluetooth){
+  $('note').textContent='This browser has no Web Bluetooth. Use Chrome or Edge.';
+}
+buildNodeCards();
+buildCalibRows();
+requestAnimationFrame(render);
+</script>
+</body>
+</html>
