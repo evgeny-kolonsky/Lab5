@@ -41,6 +41,18 @@ Based on the scripts by Anton S. (dp_traj_extract_main.py,
 dp_post_processing.py, dp_extraction_utils.py)
 
 CHANGELOG
+    3.12.1 pendulum settings saved by an older version are no longer reused:
+           an INI key is case-insensitive, so the 3.11 line "pend_L1 = 0.255"
+           (metres) was read by 3.12 as 0.255 MILLIMETRES, which collapsed the
+           gravity term of rod 2 and the coupling term and made the energy
+           look wild. Lengths under 10 mm are now refused with a message
+    3.12 pendulum parameters entered the way the rods are actually measured:
+         l1, l2 (mm) from each rod's own axis to its centre of mass, l3 (mm)
+         between the two axes, m1, m2 (g), and I1, I2 (g*m2) about each rod's
+         OWN AXIS - the quantity a period measurement gives. Gravity is a
+         constant now (9.8 m/s2) instead of a field. The energy expression is
+         the same physics, rewritten for these parameters:
+         T = (I1 + m2 l3^2) w1^2/2 + I2 w2^2/2 + m2 l3 l2 w1 w2 cos(th1-th2)
     3.11 the angular zero can be taken from a vertical line drawn on the rig:
          drag along it and its tilt in the image is subtracted from both angles.
          Works on any frame, needs no rest interval, and the line stays drawn on
@@ -103,7 +115,7 @@ CHANGELOG
     1.x  original command line scripts by Anton S.
 """
 
-__version__ = "3.11.0"
+__version__ = "3.12.1"
 
 import configparser
 import os
@@ -131,6 +143,8 @@ except Exception:
 
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
+G_DEFAULT = 9.8          # gravity, m/s2 - fixed, not a setting
+
 CONFIG_PATH = os.path.join(APP_DIR, "config.ini")
 
 DEFAULTS = {
@@ -150,15 +164,13 @@ DEFAULTS = {
     "use_timestamps": "1",
     "joint_fit": "1",
     "sg_window_ms": "110",
-    "pend_L1": "0.25",
-    "pend_L2": "0.25",
-    "pend_m1": "535.9",
-    "pend_m2": "479.4",
-    "pend_c1": "0.25",
-    "pend_c2": "0.25",
-    "pend_I1": "0",
-    "pend_I2": "0",
-    "pend_g": "9.8100",
+    "pend_l1": "212",          # mm, axis of rod 1 -> its centre of mass
+    "pend_l2": "219",          # mm, axis of rod 2 -> its centre of mass
+    "pend_l3": "255",          # mm, axis of rod 1 -> axis of rod 2
+    "pend_m1": "433",          # g
+    "pend_m2": "479",          # g
+    "pend_J1": "22.5",         # g*m2, about the axis of rod 1
+    "pend_J2": "26.3",         # g*m2, about the axis of rod 2
     "degrees": "1",
     "unwrap": "0",
     "interpolate": "1",
@@ -672,29 +684,32 @@ def refine_angles_joint(x1, y1, x2, y2, len1, len2, iters=6, w1=1.0, w2=1.0):
     return np.arctan2(A[0], A[1]), np.arctan2(B[0], B[1])
 
 
-def total_energy(th1, th2, w1, w2, L1, L2, m1, m2, g=9.81,
-                 c1=None, c2=None, I1=0.0, I2=0.0):
+def total_energy(th1, th2, w1, w2, l1, l2, l3, m1, m2, J1, J2, g=G_DEFAULT):
     """Total energy of the double pendulum, in joules.
 
-    Compound bodies: beam k has mass m_k, its centre of mass sits c_k from its
-    upper axle and its moment of inertia about that centre of mass is I_k. With
-    c_k = L_k and I_k = 0 this collapses to point masses at the joints.
+    Parameters as they are measured on the bench, one rod at a time:
 
-        T = 1/2 (I1 + m1 c1^2) w1^2
-          + 1/2 m2 (L1^2 w1^2 + c2^2 w2^2 + 2 L1 c2 w1 w2 cos(th1 - th2))
-          + 1/2 I2 w2^2
-        V = -(m1 c1 + m2 L1) g cos(th1) - m2 g c2 cos(th2)
+        l1   axis of rod 1  ->  centre of mass of rod 1          [m]
+        l2   axis of rod 2  ->  centre of mass of rod 2          [m]
+        l3   axis of rod 1  ->  axis of rod 2                    [m]
+        m1, m2   masses of the two rods                          [kg]
+        J1, J2   moments of inertia ABOUT THEIR OWN AXES         [kg m^2]
+
+    Rod 1 turns about a fixed axis, so its whole kinetic energy is J1 w1^2 / 2.
+    Rod 2 turns about the second axis, which itself moves on a circle of radius
+    l3 around the first one:
+
+        T = 1/2 (J1 + m2 l3^2) w1^2 + 1/2 J2 w2^2
+          + m2 l3 l2 w1 w2 cos(th1 - th2)
+        V = -(m1 l1 + m2 l3) g cos(th1) - m2 l2 g cos(th2)
 
     Zero is both rods hanging straight down at rest: E = T + V - V(rest).
     """
-    c1 = L1 if c1 is None else c1
-    c2 = L2 if c2 is None else c2
-    T = (0.5 * (I1 + m1 * c1 ** 2) * w1 ** 2
-         + 0.5 * m2 * (L1 ** 2 * w1 ** 2 + c2 ** 2 * w2 ** 2
-                       + 2 * L1 * c2 * w1 * w2 * np.cos(th1 - th2))
-         + 0.5 * I2 * w2 ** 2)
-    V = -(m1 * c1 + m2 * L1) * g * np.cos(th1) - m2 * g * c2 * np.cos(th2)
-    V0 = -(m1 * c1 + m2 * L1) * g - m2 * g * c2
+    T = (0.5 * (J1 + m2 * l3 ** 2) * w1 ** 2
+         + 0.5 * J2 * w2 ** 2
+         + m2 * l3 * l2 * w1 * w2 * np.cos(th1 - th2))
+    V = -(m1 * l1 + m2 * l3) * g * np.cos(th1) - m2 * l2 * g * np.cos(th2)
+    V0 = -(m1 * l1 + m2 * l3) * g - m2 * l2 * g
     return T + V - V0
 
 
@@ -718,9 +733,9 @@ def velocity_scale_check(t, th1, th2, w1, w2, pend):
     w1, w2 = w1[fin], w2[fin]
 
     def rms(s):
-        e = total_energy(th1, th2, s * w1, s * w2, pend["L1"], pend["L2"],
-                         pend["m1"], pend["m2"], pend["g"], pend.get("c1"),
-                         pend.get("c2"), pend.get("I1", 0.0), pend.get("I2", 0.0))
+        e = total_energy(th1, th2, s * w1, s * w2, pend["l1"], pend["l2"],
+                         pend["l3"], pend["m1"], pend["m2"],
+                         pend["J1"], pend["J2"], pend["g"])
         return float(np.std(e - np.polyval(np.polyfit(t, e, 1), t)))
 
     grid = np.geomspace(0.05, 4.0, 60)          # coarse scan, then refine
@@ -1216,11 +1231,10 @@ class TrackerJob(threading.Thread):
         time_warning = ""
         window_note = ""
         energy_note = "energy: pendulum parameters not set"
-        if pend and pend.get("L1") and pend.get("m1"):
-            energy = total_energy(s1, s2, w1, w2, pend["L1"], pend["L2"],
-                                  pend["m1"], pend["m2"], pend["g"],
-                                  pend.get("c1"), pend.get("c2"),
-                                  pend.get("I1", 0.0), pend.get("I2", 0.0))
+        if pend and pend.get("l3") and pend.get("m1"):
+            energy = total_energy(s1, s2, w1, w2, pend["l1"], pend["l2"],
+                                  pend["l3"], pend["m1"], pend["m2"],
+                                  pend["J1"], pend["J2"], pend["g"])
             # which smoothing window would the energy have preferred? The best
             # window depends on how fast the pendulum moves, not on the frame
             # rate alone, so this is reported rather than applied silently.
@@ -1239,10 +1253,9 @@ class TrackerJob(threading.Thread):
                     else:
                         q1, q2 = u1, u2
                         p1_, p2_ = np.gradient(u1, t), np.gradient(u2, t)
-                    ee = total_energy(q1, q2, p1_, p2_, pend["L1"], pend["L2"],
-                                      pend["m1"], pend["m2"], pend["g"],
-                                      pend.get("c1"), pend.get("c2"),
-                                      pend.get("I1", 0.0), pend.get("I2", 0.0))
+                    ee = total_energy(q1, q2, p1_, p2_, pend["l1"], pend["l2"],
+                                      pend["l3"], pend["m1"], pend["m2"],
+                                      pend["J1"], pend["J2"], pend["g"])
                     sc_ = float(np.nanstd(ee - smooth_segments(t, ee, 401, 2, 0)))
                     cand.append((sc_, wtry))
                     if wtry == win:
@@ -1272,9 +1285,11 @@ class TrackerJob(threading.Thread):
                     f"That points at a true capture rate of about "
                     f"{cfg['fps'] * sc:.4g} fps - check the FPS field.")
             fin = np.isfinite(energy)
-            energy_note = (f"energy: L={pend['L1']:.3f}/{pend['L2']:.3f} m, "
-                           f"m={1000*pend['m1']:.1f}/{1000*pend['m2']:.1f} g, "
-                           f"g={pend['g']:.4g}; E from "
+            energy_note = (f"energy: l1={1000*pend['l1']:.0f}, "
+                           f"l2={1000*pend['l2']:.0f}, l3={1000*pend['l3']:.0f} mm, "
+                           f"m={1000*pend['m1']:.0f}/{1000*pend['m2']:.0f} g, "
+                           f"J={1000*pend['J1']:.1f}/{1000*pend['J2']:.1f} g*m2; "
+                           f"E from "
                            f"{np.min(energy[fin]):.3f} to "
                            f"{np.max(energy[fin]):.3f} J"
                            if fin.any() else "energy: not computable")
@@ -1633,33 +1648,37 @@ class App(tk.Tk):
 
         # ---------------- column 2 ----------------
         b = block(where(1, 1), "Pendulum (energy check)")
-        self.var_pL1 = tk.StringVar(value=self.cfg["pend_L1"])
-        self.var_pL2 = tk.StringVar(value=self.cfg["pend_L2"])
+        self.var_pl1 = tk.StringVar(value=self.cfg["pend_l1"])
+        self.var_pl2 = tk.StringVar(value=self.cfg["pend_l2"])
+        self.var_pl3 = tk.StringVar(value=self.cfg["pend_l3"])
         self.var_pm1 = tk.StringVar(value=self.cfg["pend_m1"])
         self.var_pm2 = tk.StringVar(value=self.cfg["pend_m2"])
-        self.var_pc1 = tk.StringVar(value=self.cfg["pend_c1"])
-        self.var_pc2 = tk.StringVar(value=self.cfg["pend_c2"])
-        self.var_pI1 = tk.StringVar(value=self.cfg["pend_I1"])
-        self.var_pI2 = tk.StringVar(value=self.cfg["pend_I2"])
-        self.var_pg = tk.StringVar(value=self.cfg["pend_g"])
+        self.var_pJ1 = tk.StringVar(value=self.cfg["pend_J1"])
+        self.var_pJ2 = tk.StringVar(value=self.cfg["pend_J2"])
         grid = ttk.Frame(b)
         grid.pack(fill="x")
-        ttk.Label(grid, text="upper").grid(row=0, column=1, padx=2)
-        ttk.Label(grid, text="lower").grid(row=0, column=2, padx=2)
-        rows = (("L, m   axle to axle", self.var_pL1, self.var_pL2),
-                ("m, g   mass", self.var_pm1, self.var_pm2),
-                ("c, m   axle to c.o.m.", self.var_pc1, self.var_pc2),
-                ("I, kg*m2  about c.o.m.", self.var_pI1, self.var_pI2))
+        ttk.Label(grid, text="rod 1").grid(row=0, column=1, padx=2)
+        ttk.Label(grid, text="rod 2").grid(row=0, column=2, padx=2)
+        rows = (("l, mm   axis to centre of mass", self.var_pl1, self.var_pl2),
+                ("m, g    mass", self.var_pm1, self.var_pm2),
+                ("I, g*m2   about its own axis", self.var_pJ1, self.var_pJ2))
         for r, (lab, va, vb) in enumerate(rows, start=1):
             ttk.Label(grid, text=lab).grid(row=r, column=0, sticky="w", pady=1)
             ttk.Entry(grid, textvariable=va, width=9).grid(row=r, column=1, padx=2)
             ttk.Entry(grid, textvariable=vb, width=9).grid(row=r, column=2, padx=2)
-        ttk.Label(grid, text="g, m/s2").grid(row=5, column=0, sticky="w", pady=1)
-        ttk.Entry(grid, textvariable=self.var_pg, width=9).grid(row=5, column=1, padx=2)
-        hint(b, "c = L and I = 0 means point masses at the joints; enter the "
-                "measured centre of mass and inertia for compound beams. Zero of "
-                "energy = both rods hanging at rest. E_J goes into the CSV and "
-                "into the Energy plot; a flat curve with slow decay means the "
+        ttk.Label(grid, text="l3, mm   axis 1 to axis 2").grid(row=4, column=0,
+                                                               sticky="w", pady=1)
+        ttk.Entry(grid, textvariable=self.var_pl3, width=9).grid(row=4, column=1,
+                                                                 padx=2)
+        hint(b, "All four quantities are measured with one rod at a time: the "
+                "mass, the distance from its own axis to its centre of mass "
+                "(balance it on a knife edge), and the moment of inertia about "
+                "that same axis - the one you get from the period of small "
+                "swings, I = m g l (T / 2 pi)^2, NOT the one about the centre "
+                "of mass. l3 is the distance between the two axes.\n"
+                f"Gravity is fixed at {G_DEFAULT} m/s2. Zero of energy = both "
+                "rods hanging at rest. E_J goes into the CSV and into the "
+                "Energy plot; a smooth curve with a slow decay means the "
                 "tracking is sound.")
 
         b = block(where(1, 1), "Kinematic post-processing")
@@ -1762,15 +1781,13 @@ class App(tk.Tk):
             "use_timestamps": "1" if self.var_ts.get() else "0",
             "joint_fit": "1" if self.var_joint.get() else "0",
             "sg_window_ms": str(self.var_sg.get()),
-            "pend_L1": self.var_pL1.get(),
-            "pend_L2": self.var_pL2.get(),
+            "pend_l1": self.var_pl1.get(),
+            "pend_l2": self.var_pl2.get(),
+            "pend_l3": self.var_pl3.get(),
             "pend_m1": self.var_pm1.get(),
             "pend_m2": self.var_pm2.get(),
-            "pend_c1": self.var_pc1.get(),
-            "pend_c2": self.var_pc2.get(),
-            "pend_I1": self.var_pI1.get(),
-            "pend_I2": self.var_pI2.get(),
-            "pend_g": self.var_pg.get(),
+            "pend_J1": self.var_pJ1.get(),
+            "pend_J2": self.var_pJ2.get(),
             "degrees": "1" if self.var_deg.get() else "0",
             "unwrap": "1" if self.var_unwrap.get() else "0",
             "interpolate": "1" if self.var_interp.get() else "0",
@@ -2226,20 +2243,47 @@ class App(tk.Tk):
         self.job.start()
 
     def pendulum_params(self):
-        """Pendulum geometry and masses in SI, or None if not filled in."""
+        """Bench measurements turned into SI, or None if not filled in.
+
+        The fields are in the units they are measured in - mm, g, g*m2 - and
+        the moments of inertia are about each rod's OWN AXIS, which is what a
+        period measurement gives directly.
+        """
         try:
-            p = {"L1": float(self.var_pL1.get()), "L2": float(self.var_pL2.get()),
+            p = {"l1": float(self.var_pl1.get()) / 1000.0,
+                 "l2": float(self.var_pl2.get()) / 1000.0,
+                 "l3": float(self.var_pl3.get()) / 1000.0,
                  "m1": float(self.var_pm1.get()) / 1000.0,
                  "m2": float(self.var_pm2.get()) / 1000.0,
-                 "c1": float(self.var_pc1.get() or 0) or None,
-                 "c2": float(self.var_pc2.get() or 0) or None,
-                 "I1": float(self.var_pI1.get() or 0),
-                 "I2": float(self.var_pI2.get() or 0),
-                 "g": float(self.var_pg.get())}
+                 "J1": float(self.var_pJ1.get()) / 1000.0,
+                 "J2": float(self.var_pJ2.get()) / 1000.0,
+                 "g": G_DEFAULT}
         except ValueError:
             return None
-        if min(p["L1"], p["L2"], p["m1"], p["m2"], p["g"]) <= 0:
+        if min(p["l1"], p["l2"], p["l3"], p["m1"], p["m2"],
+               p["J1"], p["J2"]) <= 0:
             return None
+        # a length of a few millimetres almost always means metres were typed
+        # into a field that asks for millimetres
+        small = [n for n in ("l1", "l2", "l3") if p[n] < 0.01]
+        if small:
+            messagebox.showwarning(
+                "Check the lengths",
+                "%s shorter than 10 mm. These fields are in MILLIMETRES "
+                "(e.g. 212, not 0.212). The energy would be meaningless, so "
+                "it will not be computed." % (", ".join(small)))
+            return None
+        # a rod cannot have less inertia about its axis than a point mass at
+        # its centre of mass would - that would mean a measurement slipped
+        for k, (J, m, l) in (("1", (p["J1"], p["m1"], p["l1"])),
+                             ("2", (p["J2"], p["m2"], p["l2"]))):
+            if J < m * l * l:
+                messagebox.showwarning(
+                    "Check the inertia",
+                    f"I{k} = {1000*J:.1f} g*m2 is smaller than m{k}*l{k}^2 = "
+                    f"{1000*m*l*l:.1f} g*m2. The moment of inertia must be "
+                    f"given about the AXIS of rod {k}, not about its centre of "
+                    f"mass. The energy will be computed anyway.")
         return p
 
     def update_fps_check(self):
@@ -2719,14 +2763,30 @@ def scrollable(parent):
 # =====================================================================
 
 def load_config():
-    """Read config.ini next to this script; missing keys fall back to defaults."""
+    """Read config.ini next to this script; missing keys fall back to defaults.
+
+    Settings written by a version older than 3.12 are NOT reused for the
+    pendulum: the fields changed both their meaning and their units then
+    (metres -> millimetres, inertia about the centre of mass -> about the
+    axis), and an INI key is case-insensitive, so the old "pend_L1 = 0.255"
+    would be read as 0.255 MILLIMETRES and silently wreck the energy.
+    """
     cfg = dict(DEFAULTS)
     parser = configparser.ConfigParser()
     try:
         if parser.read(CONFIG_PATH, encoding="utf-8") and parser.has_section("dp"):
+            old = parser.get("dp", "version", fallback="0")
+            stale = tuple(int(x) for x in (old.split(".") + ["0", "0"])[:2]
+                          if x.isdigit()) < (3, 12)
             for key in DEFAULTS:
+                if key.startswith("pend_") and stale:
+                    continue
                 if parser.has_option("dp", key):
                     cfg[key] = parser.get("dp", key)
+            if stale:
+                print("config.ini is older than 3.12 - the pendulum parameters "
+                      "were reset to the defaults (the units changed)",
+                      file=sys.stderr)
     except Exception as e:
         print("config.ini could not be read:", e, file=sys.stderr)
     return cfg
