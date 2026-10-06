@@ -8,7 +8,7 @@ and they share one description of the rig:
 | `dp_gui.py` | tracks a video, exports angles, velocities and energy to CSV |
 | `dp_sim.py` | integrates the model and compares runs |
 | `dp_flipmap.py` | draws the map of the time to the first flip over a rectangle of starting angles |
-| `config.ini` | the bench measurements `dp_flipmap.py` reads |
+| `config.ini` | the bench measurements, read **and written** by both `dp_sim.py` and `dp_flipmap.py` |
 
 ---
 
@@ -38,7 +38,8 @@ Put all the files in one folder:
 dp_gui.py
 dp_sim.py
 dp_flipmap.py
-config.ini          <- created automatically on the first run if absent
+config.ini          <- the rods; created automatically if absent
+dp_sim.ini          <- the simulator's own state; created by dp_sim.py
 ```
 
 ---
@@ -65,6 +66,12 @@ half2 = 30      ; the same for rod 2, s
 g = 9.8         ; m/s2
 ```
 
+`dp_sim.py` reads the same file and writes it back when you press **Save
+settings**, so a rod measured again in the simulator window changes the flip
+map as well. What belongs to the simulator alone — duration, RK4 step, output
+step, the last angles, the twin perturbation, the CSV folder — stays in
+`dp_sim.ini` and never touches `config.ini`.
+
 Everything else follows from those ten numbers:
 
 ```
@@ -83,7 +90,7 @@ is natural where it is used:
 
 | | lengths | masses | inertia |
 |---|---|---|---|
-| `config.ini`, `dp_sim.ini` | metres | kilograms | derived from `T` |
+| `config.ini` | metres | kilograms | derived from `T` |
 | `dp_gui.py` settings tab | millimetres | grams | g·m², **about the axis** |
 
 ---
@@ -132,6 +139,7 @@ is natural where it is used:
 | `--flip-of {2,1,0}` | `2` | which rod must go over the top: the lower one, the upper one, or whichever is first |
 | `--mark TH1 TH2` | — | put a circle at this point |
 | `--colour NAME` | `magma` | `magma`, `ice`, `cubehelix` or `mono` |
+| `--no-csv` | off | do not write the raw map beside the picture |
 | `--out PATH` | built from the parameters | output picture |
 
 ### Colours and saving
@@ -162,7 +170,33 @@ records the run:
 
 ```
 flipmap_th1_90to180_th2_-60to60_320x220_h15_dt3ms_fric_magma.png
+flipmap_th1_90to180_th2_-60to60_320x220_h15_dt3ms_fric_magma.csv
 ```
+
+### The CSV
+
+Beside every picture the raw map is written under the same name, one line per
+starting point:
+
+```
+th1_deg, th2_deg, time_s
+```
+
+`time_s` is the time to the first flip; it is **empty** where no flip happened
+inside the horizon. Above the data sits a `#` header with everything needed to
+reproduce the run: the ten bench numbers and where they came from, the derived
+`I`, `tau`, `c`, the five constants, the two small-oscillation modes, the
+energy threshold, the grid and its steps, the horizon, the RK4 step, the flip
+criterion, and the fraction of the grid that flipped. The first line says how
+many header lines there are, so both of these work:
+
+```python
+pandas.read_csv(path, comment="#")
+numpy.genfromtxt(path, delimiter=",", names=True, skip_header=32)
+```
+
+The CSV is saved with the same protection as the picture — never overwriting,
+falling back to a free name and then to the temporary folder.
 
 ### Examples
 
@@ -209,7 +243,8 @@ from the axis to the centre of mass, the period `T` of small swings and the
 time in which the amplitude halves. Everything else is derived and displayed
 as you type: `I1`, `I2`, `tau1`, `tau2`, `c1`, `c2`, the five constants below
 and the two small-oscillation modes, each shown as period, frequency and
-`omega` together. The values live in `dp_sim.ini` beside the script.
+`omega` together. These ten numbers are stored in `config.ini`, the file
+`dp_flipmap.py` reads; the rest of the window's state goes to `dp_sim.ini`.
 
 **Model tab** — a schematic pendulum you drag with the mouse: grab the middle
 joint to set `theta1`, the lower end to set `theta2`. Both angles are also

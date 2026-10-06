@@ -43,7 +43,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.ini")
 sys.path.insert(0, APP_DIR)
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # --------------------------------------------------------------------------
 #  configuration
@@ -249,28 +249,56 @@ def free_path(path):
     return "%s_%d%s" % (stem, int(time.time()), ext)
 
 
-def save_figure(fig, path, dpi=130):
-    """Save without ever losing the run.
+def write_somewhere(path, writer):
+    """Call writer(path) without ever losing the run.
 
-    A picture already open in a viewer cannot be overwritten on Windows, and
-    the whole folder may be read-only. So: never overwrite an existing file,
-    and if writing still fails, step aside to the next free name and finally
-    to the temporary folder.
+    A file already open in a viewer cannot be overwritten on Windows, and the
+    whole folder may be read-only. So: never overwrite an existing file, and
+    if writing still fails, step aside to the next free name and finally to
+    the temporary folder.
     """
     import tempfile
     tried = []
-    for cand in (free_path(path), free_path(path), 
+    for cand in (free_path(path), free_path(path),
                  os.path.join(tempfile.gettempdir(),
                               os.path.basename(free_path(path)))):
         if cand in tried:
             continue
         tried.append(cand)
         try:
-            fig.savefig(cand, dpi=dpi)
+            writer(cand)
             return cand
         except OSError as exc:
             print("   could not write %s (%s)" % (cand, exc))
     return None
+
+
+def save_figure(fig, path, dpi=130):
+    return write_somewhere(path, lambda f: fig.savefig(f, dpi=dpi))
+
+
+def save_csv(path, g1, g2, TF, head):
+    """The raw map: one line per starting point, columns th1, th2, time.
+
+    `head` is a list of lines; they are written as '#' comments, and the very
+    first line says how many of them there are, so the file can be read with
+    skip_header as well as with comment='#'.
+    """
+    lines = ["dp_flipmap %s raw map - %d header lines start with '#', then the "
+             "column names" % (__version__, len(head) + 1)] + list(head)
+
+    def writer(target):
+        with open(target, "w", encoding="utf-8", newline="") as fh:
+            for ln in lines:
+                fh.write(("# " + ln if ln else "#") + "\n")
+            fh.write("th1_deg,th2_deg,time_s\n")
+            for j, th2 in enumerate(g2):
+                for i, th1 in enumerate(g1):
+                    t = TF[j, i]
+                    fh.write("%.4f,%.4f,%s\n"
+                             % (th1, th2, "" if not np.isfinite(t) else "%.4f" % t))
+
+    return write_somewhere(path, writer)
 
 
 def grid_states(th1_deg, th2_deg):
@@ -307,6 +335,8 @@ def main():
                     choices=("magma", "cubehelix", "ice", "mono"),
                     help="colour scheme; all of them run dark (early flip) to "
                          "pale (late), and no flip at all stays pure white")
+    ap.add_argument("--no-csv", action="store_true",
+                    help="do not write the raw map beside the picture")
     ap.add_argument("--out", default=None,
                     help="output PNG; by default the name is built from the "
                          "parameters and never overwrites an existing file")
@@ -354,6 +384,62 @@ def main():
     if ok.any():
         print("earliest flip %.2f s, latest %.2f s" % (tf[ok].min(), tf[ok].max()))
 
+    import datetime
+    meta = [
+        "written           : " + datetime.datetime.now().isoformat(timespec="seconds"),
+        "model             : " + ("dp_sim.py" if SIM is not None
+                                  else "built-in copy of the dp_sim model"),
+        "parameters from   : " + CONFIG_PATH,
+        "",
+        "rods, as measured one at a time:",
+        "  m1 = %.6g kg   l1 = %.6g m   T1 = %.6g s   half1 = %.6g s"
+        % (cfg["m1"], cfg["l1"], cfg["T1"], cfg["half1"]),
+        "  m2 = %.6g kg   l2 = %.6g m   T2 = %.6g s   half2 = %.6g s"
+        % (cfg["m2"], cfg["l2"], cfg["T2"], cfg["half2"]),
+        "  l3 = %.6g m (axis to axis)   g = %.6g m/s2" % (cfg["l3"], cfg["g"]),
+        "derived:",
+        "  I1 = %.6g   I2 = %.6g kg m2 (about the centres of mass)"
+        % (p["I1"], p["I2"]),
+        "  tau1 = %.6g   tau2 = %.6g s   (amplitude ~ exp(-t/2 tau))"
+        % (p["tau1"], p["tau2"]),
+        "  c1 = %.6g   c2 = %.6g N m s   (bearing friction)"
+        % ((p["I1"] + p["m1"] * p["l1"] ** 2) / p["tau1"] if p["tau1"] > 0 else 0.0,
+           (p["I2"] + p["m2"] * p["l2"] ** 2) / p["tau2"] if p["tau2"] > 0 else 0.0),
+        "  a = %.6g   b = %.6g   d = %.6g   e1 = %.6g   e2 = %.6g"
+        % (a, b, d, e1, e2),
+        "  small oscillations: %.4f s (%.4f Hz) and %.4f s (%.4f Hz)"
+        % (2 * np.pi / w[0], w[0] / 2 / np.pi, 2 * np.pi / w[1], w[1] / 2 / np.pi),
+        "  flip needs E > 2 e2 = %.6g J; on theta2_0 = 0 that is theta1_0 > "
+        "%.4f deg" % (2 * e2, edge),
+        "",
+        "run:",
+        "  theta1_0 from %g to %g deg, %d points (step %.6g deg)"
+        % (g1[0], g1[-1], len(g1), (g1[1] - g1[0]) if len(g1) > 1 else 0.0),
+        "  theta2_0 from %g to %g deg, %d points (step %.6g deg)"
+        % (g2[0], g2[-1], len(g2), (g2[1] - g2[0]) if len(g2) > 1 else 0.0),
+        "  released from rest; horizon %g s; RK4 fixed step %g s"
+        % (args.horizon, args.dt),
+        "  flip = |theta%s| > 180 deg"
+        % ({2: "2", 1: "1", 0: "1| or |theta2"}[args.flip_of]),
+        "  friction: %s" % ("none (half1 = half2 = 0)"
+                            if damping_matrix(p) is None else
+                            "bearings, tau = %.4g / %.4g s" % (p["tau1"], p["tau2"])),
+        "result:",
+        "  flipped within the horizon: %.2f %% of the grid" % (100 * ok.mean()),
+        "  earliest %s, latest %s"
+        % (("%.4f s" % tf[ok].min()) if ok.any() else "-",
+           ("%.4f s" % tf[ok].max()) if ok.any() else "-"),
+        "",
+        "columns: th1_deg, th2_deg = the starting angles from the downward "
+        "vertical, + to the right;",
+        "         time_s = time to the first flip; EMPTY means no flip within "
+        "the horizon",
+        "",
+        "read with:  pandas.read_csv(path, comment='#')",
+        "            numpy.genfromtxt(path, delimiter=',', names=True, "
+        "skip_header=<the number on the first line>)",
+    ]
+
     out = args.out or os.path.join(os.getcwd(),
                                    auto_name(args, len(g1), len(g2),
                                              damping_matrix(p) is not None,
@@ -400,8 +486,15 @@ def main():
         print("\nwritten: %s" % saved if saved else
               "\nTHE PICTURE COULD NOT BE SAVED ANYWHERE - the numbers above "
               "are still good")
+        out = saved or out
     except Exception as exc:
         print("\n(no plot: %s)" % exc)
+
+    if not args.no_csv:
+        csv_path = os.path.splitext(out)[0] + ".csv"
+        written = save_csv(csv_path, g1, g2, TF, meta)
+        print("written: %s" % written if written else
+              "THE CSV COULD NOT BE SAVED ANYWHERE")
 
 
 if __name__ == "__main__":
