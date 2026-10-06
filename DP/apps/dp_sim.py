@@ -69,6 +69,11 @@ CHANGELOG
            measured half-life into tau, a live reminder of what tau means, and
            a rescaling of tau1, tau2 to reproduce a measured energy decay of
            the assembled pendulum.
+    1.5.0  the ten bench numbers moved to config.ini, shared with
+           dp_flipmap.py, so the simulator and the map cannot disagree about
+           the pendulum. dp_sim.ini keeps only this window's own state
+           (duration, steps, last angles, twin perturbation, CSV folder).
+           config.ini is created from the defaults when it is missing
     1.4.0  simplified: the settings tab now asks only for what is measured on
            the bench with one rod at a time - mass, distance to the centre of
            mass, period T and the time in which the amplitude halves. Moments
@@ -76,7 +81,7 @@ CHANGELOG
            alternative friction models and conversion dialogs are gone.
 """
 
-__version__ = "1.4.0"
+__version__ = "1.5.0"
 
 import configparser
 import os
@@ -90,7 +95,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
-CONFIG_PATH = os.path.join(APP_DIR, "dp_sim.ini")
+CONFIG_PATH = os.path.join(APP_DIR, "dp_sim.ini")   # this program's own state
+BENCH_PATH = os.path.join(APP_DIR, "config.ini")    # the rods, shared with
+                                                    # dp_flipmap.py
+# The ten numbers measured on the bench live in config.ini so that the
+# simulator and the flip map can never disagree about the pendulum. Everything
+# else - duration, steps, the angles last used, the CSV folder - stays in
+# dp_sim.ini, which is private to this program.
+BENCH_KEYS = ("m1", "m2", "l1", "l2", "l3", "T1", "T2", "half1", "half2", "g")
 
 DEFAULTS = {
     "version": __version__,
@@ -554,10 +566,17 @@ class App(tk.Tk):
         ttk.Entry(row, textvariable=self.var["csv_dir"]).pack(side="left", fill="x",
                                                               expand=True, padx=2)
         ttk.Button(row, text="...", width=3, command=self.pick_dir).pack(side="left")
-        ttk.Button(b, text="Save settings to dp_sim.ini",
+        ttk.Button(b, text="Save settings",
                    command=self.save_settings).pack(fill="x", pady=(6, 0))
-        ttk.Label(b, text=CONFIG_PATH, foreground="#666",
+        ttk.Label(b, text="the rods ->  " + BENCH_PATH, foreground="#046",
                   wraplength=330).pack(anchor="w")
+        ttk.Label(b, text="everything else ->  " + CONFIG_PATH,
+                  foreground="#666", wraplength=330).pack(anchor="w")
+        hint(b, "config.ini holds the ten bench numbers and is read by "
+                "dp_flipmap.py as well, so a rod measured again here changes "
+                "the flip map too. dp_sim.ini keeps only what belongs to this "
+                "window: duration, steps, the last angles, the twin "
+                "perturbation and the CSV folder.")
         ttk.Label(b, text=f"dp_sim.py version {__version__}",
                   font=("", 9, "bold")).pack(anchor="w", pady=(6, 0))
         self.show_coefficients()
@@ -1031,7 +1050,8 @@ class App(tk.Tk):
         try:
             save_config(self.collect_config())
             if not quiet:
-                self.status.config(text=f"settings saved to {CONFIG_PATH}")
+                self.status.config(
+                    text=f"rods -> {BENCH_PATH};  rest -> {CONFIG_PATH}")
         except Exception as e:
             if not quiet:
                 messagebox.showerror("Could not save settings", str(e))
@@ -1077,24 +1097,57 @@ def write_csv(path, runs):
                             r["T"][i], r["V"][i], r["E"][i], x2[i], y2[i]))
 
 
+def save_bench(values):
+    """Write the ten bench numbers to config.ini, the file dp_flipmap.py reads."""
+    bench = configparser.ConfigParser()
+    bench["pendulum"] = {k: str(values[k]) for k in BENCH_KEYS if k in values}
+    with open(BENCH_PATH, "w", encoding="utf-8") as fh:
+        fh.write("# Double pendulum bench measurements, one rod at a time.\n"
+                 "# Lengths in metres, masses in kilograms, times in seconds.\n"
+                 "# half1 = half2 = 0 means no friction.\n")
+        bench.write(fh)
+
+
 def load_config():
+    """Simulator settings from dp_sim.ini, the rods from config.ini.
+
+    config.ini wins for the pendulum, so editing that one file changes both
+    this program and dp_flipmap.py. If it does not exist yet it is created
+    from the defaults.
+    """
     cfg = dict(DEFAULTS)
     parser = configparser.ConfigParser()
     try:
         if parser.read(CONFIG_PATH, encoding="utf-8") and parser.has_section("sim"):
             for k in DEFAULTS:
-                if parser.has_option("sim", k):
+                if k not in BENCH_KEYS and parser.has_option("sim", k):
                     cfg[k] = parser.get("sim", k)
     except Exception as e:
         print("dp_sim.ini could not be read:", e, file=sys.stderr)
+
+    bench = configparser.ConfigParser()
+    try:
+        if bench.read(BENCH_PATH, encoding="utf-8") and \
+                bench.has_section("pendulum"):
+            for k in BENCH_KEYS:
+                if bench.has_option("pendulum", k):
+                    cfg[k] = bench.get("pendulum", k)
+        else:
+            save_bench(cfg)
+            print("config.ini was created next to dp_sim.py", file=sys.stderr)
+    except Exception as e:
+        print("config.ini could not be read:", e, file=sys.stderr)
     return cfg
 
 
 def save_config(values):
+    """The rods go to config.ini, everything else to dp_sim.ini."""
     parser = configparser.ConfigParser()
-    parser["sim"] = {k: str(v) for k, v in values.items()}
+    parser["sim"] = {k: str(v) for k, v in values.items()
+                     if k not in BENCH_KEYS}
     with open(CONFIG_PATH, "w", encoding="utf-8") as fh:
         parser.write(fh)
+    save_bench(values)
 
 
 if __name__ == "__main__":
