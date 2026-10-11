@@ -1,14 +1,117 @@
 """
 Oscilloscope viewer for the Agilent/Keysight InfiniiVision DSO-X 3014A.
 
-Standalone version: needs only pyvisa, numpy, matplotlib and tkinter.
+Standalone: needs only pyvisa, numpy, matplotlib and tkinter.
 No oscilloscope_api.py, no logo file, no log server required.
 
     pip install pyvisa pyvisa-py numpy matplotlib
 
-pyvisa-py is a pure-python VISA backend and works over USB on Windows if
-the instrument driver is installed. If you already have the Keysight IO
-Libraries or NI-VISA, the script will use those automatically.
+pyvisa-py is a pure-python VISA backend and works over USB on Windows if the
+instrument driver is installed. If the Keysight IO Libraries or NI-VISA are
+already present, the script uses those automatically.
+
+
+CHANGELOG
+=========
+Keep this list up to date: bump VERSION below and add a line here with every
+change. The version is shown in the window title, in the status bar and in the
+first line of the console log, so a saved record can always be traced back to
+the code that produced it.
+
+2.9  (current)
+     The timebase dropdown is gone. It wrote a setting the instrument already
+     owns, so it was only ever a second copy that could disagree with the
+     first; the record length is read from the waveform preamble regardless.
+     What remains is one measured line: timebase, record length, point count,
+     sample rate. When all three channels are captured it also reports the
+     potentiometer, fitted from the CH3 divider with R0 and g21 from
+     config.ini, flagging a poor fit. The reconnect button is gone too:
+     Capture now clears a dead VISA session, reconnects and retries once by
+     itself, and only reports an error if that also fails. All interface text
+     is English.
+
+2.8
+     Who owns the timebase is now explicit. The dropdown opens on
+     "default by scope": in that mode the program never writes the timebase
+     and the instrument is in charge, front panel included. Picking a concrete
+     entry writes it once; if the panel is then turned, the label says so
+     instead of the box quietly resyncing. The list stops at 100 ms/div = 1 s.
+     Interface text is English throughout.
+
+2.7
+     The timebase dropdown listed bare times ("5 ms") with an "s/div:" label
+     beside it, so an entry could be read as the whole record. Every entry now
+     states both: "5 ms/div = 50 ms". The label beside it reports what was
+     actually captured, measured from the data rather than from the setting.
+
+2.6
+     Timebase handling made honest. The s/div list is only a COMMAND, sent to
+     the scope when you pick a new entry; the length of a record is always
+     whatever the instrument is set to. Three fixes:
+       - the list used to snap an off-list scope setting to the nearest entry,
+         silently. A scope at 200 ms/div (a 2 s record) was displayed as
+         "50 ms". Now the real value is shown and added to the dropdown, and
+         a warning goes to the log.
+       - the list was extended to 1 s/div (100, 200, 500 ms, 1 s added), so
+         the slow settings actually used in the lab are reachable.
+       - a label beside the list now reports the record length, point count
+         and sample rate as measured, and it is refreshed after every capture,
+         so turning the front-panel knob is picked up.
+
+2.5.1
+     The "file saved" modal dialog is gone; it interrupted every capture in a
+     sweep. The full path now goes to the console (prefixed SAVED) and to the
+     status bar. The error dialog on a failed save is kept.
+
+2.5
+     All four inputs are read instead of channels 1 and 2 only. With three or
+     more channels the Y-t view switches to scope divisions on a common axis,
+     since several calibrated y axes stop being legible. The XY swap button
+     became a pair of X/Y channel selectors, filled from the channels actually
+     captured. ':DIGitize' is refused by the scope in XY and ROLL timebase
+     modes, so the mode is switched to MAIN for the capture and restored AFTER
+     the waveform is transferred (restoring it earlier restarts acquisition
+     and invalidates the memory being read).
+
+2.4
+     Deep memory worked on the display but timed out on transfer: the
+     acquisition timeout, scaled to the timebase and as short as 15 s, was
+     being reused for a ':WAVeform:DATA?' of half a million points. Transfers
+     now get their own timeout scaled to the point count. The request is also
+     clamped to ':ACQuire:POINts?', the VISA chunk size is raised to 1 MiB,
+     and the transfer rate is logged.
+
+2.3
+     Saving opens a real folder/name dialog that starts in the last folder
+     used, and that folder is written back to config.ini. An s/div selector
+     was added to the toolbar. After each capture the record is checked
+     against the scope's own frequency counter and a warning is shown when it
+     holds fewer than MIN_PERIODS_WARN cycles - too short a record cannot show
+     a switch between scrolls, which looks like a single scroll.
+
+2.2
+     XY (phase portrait) view added. It uses plain striding rather than the
+     envelope decimation of the Y-t view: envelope decimation is a time-domain
+     trick and would smear the trajectory. Strided data is drawn as a thin
+     semi-transparent line so the layered sheets of an attractor stay visible
+     instead of saturating into a blob.
+
+2.1
+     Made standalone. Own find_scope() and Oscilloscope class written directly
+     on pyvisa, replacing the lab's oscilloscope_api.py. Splash screen and log
+     server made optional. Added a reconnect button, a warning when a channel
+     input is set to 50 ohm (it loads a high-impedance circuit enough to stop
+     the oscillation, which looks like a dead channel), and ':RUN' after a
+     capture, since ':DIGitize' leaves the instrument stopped.
+
+2.0
+     First version for the DSO-X 3014A, adapted from the lab's DSO2000X
+     viewer. The SCPI command set is the same across InfiniiVision series;
+     what changes is memory, 2.5 kpt to 1 Mpt per channel. Deep-memory
+     acquisition added (':WAVeform:POINts:MODE RAW' - without it the scope
+     silently returns about 1000 points of screen resolution whatever you
+     ask for), envelope decimation for display, and np.savetxt for saving,
+     a python loop taking tens of seconds on a megapoint file.
 """
 
 import tkinter as tk
@@ -29,7 +132,8 @@ import logging.handlers
 
 import pyvisa
 
-VERSION = "2.1-standalone"
+VERSION = "2.9"
+VERSION_NOTE = "scope owns the timebase; R from CH3; English UI"
 
 # ---------------------------------------------------------------------------
 # Settings (all overridable from config.ini, section [settings])
@@ -38,11 +142,13 @@ DEFAULT_SAVE_PATH = os.path.join(os.path.expanduser("~"), "Documents")
 RAW_POINTS = 1000000            # points to request per channel (1 Mpt on the 3014A)
 MAX_DISPLAY_POINTS = 20000      # decimate to this many before plotting (Y-t view)
 XY_MAX_POINTS = 150000          # max points drawn in the XY (phase portrait) view
-TIMEBASE_CHOICES = [            # s/div offered in the toolbar; 10 divisions on screen
-    ("100 us", 100e-6), ("200 us", 200e-6), ("500 us", 500e-6),
-    ("1 ms", 1e-3), ("2 ms", 2e-3), ("5 ms", 5e-3),
-    ("10 ms", 10e-3), ("20 ms", 20e-3), ("50 ms", 50e-3),
-]
+# The timebase is NOT commanded from here. The instrument owns it: the record
+# length always comes back in the waveform preamble, so a dropdown that writes
+# it would only be a second, stale copy of the same setting. What is shown is
+# what was measured.
+R0_DEFAULT = 992.0              # fixed series resistor, ohm
+G21_DEFAULT = 1.0               # gain ratio of the v_C2 channel to the v_C1 channel
+RPOT_MAX = 1000.0               # potentiometer full scale, ohm - used as a sanity check
 MIN_PERIODS_WARN = 50           # warn if a record holds fewer cycles than this
 CHANNELS = (1, 2, 3, 4)         # all four inputs; only displayed ones are read
 VISA_TIMEOUT_MS = 60000         # a 1 Mpt transfer is slow
@@ -84,6 +190,15 @@ if USE_LOG_SERVER:                                          # optional, never fa
 # ---------------------------------------------------------------------------
 # Instrument layer  (replaces oscilloscope_api.py)
 # ---------------------------------------------------------------------------
+def _fmt_time(x):
+    """Human-readable seconds: 2 s, 200 ms, 500 us."""
+    if x >= 1:
+        return f"{x:g} s"
+    if x >= 1e-3:
+        return f"{x*1e3:g} ms"
+    return f"{x*1e6:g} us"
+
+
 def find_scope():
     """Search VISA resources for an InfiniiVision scope.
 
@@ -171,10 +286,6 @@ class Oscilloscope:
             names.append(f"CH{ch}")
         return {'timebase': tb, 'channels': names,
                 'offsets': offsets, 'scales': scales}
-
-    def set_timebase(self, s_per_div):
-        """Set the horizontal scale in seconds per division."""
-        self.inst.write(f":TIMebase:SCALe {s_per_div:.9g}")
 
     def measure_frequency(self, channels=CHANNELS):
         """Ask the scope's built-in counter for the signal frequency.
@@ -433,7 +544,7 @@ def envelope_decimate(t, y, max_points):
 class App:
     def __init__(self, master):
         self.master = master
-        master.title(f"צופה באוסצילוסקופ (DSO-X 3014A) v{VERSION}")
+        master.title(f"Oscilloscope viewer - DSO-X 3014A - v{VERSION}")
 
         # config.ini is looked for next to the script and next to the exe
         parser = configparser.ConfigParser()
@@ -452,6 +563,8 @@ class App:
         self.save_root = parser.get('settings', 'save_path', fallback=DEFAULT_SAVE_PATH)
         self.deep_memory = parser.getboolean('settings', 'deep_memory', fallback=True)
         self.raw_points = parser.getint('settings', 'raw_points', fallback=RAW_POINTS)
+        self.r0 = parser.getfloat('settings', 'r0', fallback=R0_DEFAULT)
+        self.g21 = parser.getfloat('settings', 'g21', fallback=G21_DEFAULT)
         logger.info("Save path: %s | deep memory: %s | points: %d",
                     self.save_root, self.deep_memory, self.raw_points)
 
@@ -479,7 +592,7 @@ class App:
         }
 
         self.status_var = tk.StringVar()
-        self.status_var.set("...מחפש אוסצילוסקופ")
+        self.status_var.set("Searching for oscilloscope...")
 
         self.fig, self.ax = plt.subplots(figsize=(10, 6))
         self.ax.xaxis.set_major_formatter(FuncFormatter(self.format_time_english))
@@ -492,15 +605,13 @@ class App:
         frame = tk.Frame(master)
         frame.pack()
 
-        self.capture_btn = tk.Button(frame, text="מדידה", command=self.capture)
+        self.capture_btn = tk.Button(frame, text="Capture", width=9,
+                                     command=self.capture)
         self.capture_btn.pack(side=tk.LEFT, padx=5)
 
-        self.save_btn = tk.Button(frame, text="CSVשמירה כ־", command=self.save,
-                                  state=tk.DISABLED)
+        self.save_btn = tk.Button(frame, text="Save CSV", width=9,
+                                  command=self.save, state=tk.DISABLED)
         self.save_btn.pack(side=tk.LEFT, padx=5)
-
-        self.reconnect_btn = tk.Button(frame, text="חיבור מחדש", command=self.reconnect)
-        self.reconnect_btn.pack(side=tk.LEFT, padx=5)
 
         self.deep_var = tk.BooleanVar(value=self.deep_memory)
         tk.Checkbutton(frame, text="Deep memory", variable=self.deep_var,
@@ -522,13 +633,11 @@ class App:
         for box in (self.xsel, self.ysel):
             box.bind("<<ComboboxSelected>>", lambda e: self.redraw_plot())
 
-        tk.Label(frame, text="s/div:").pack(side=tk.LEFT, padx=(15, 2))
-        self.tb_var = tk.StringVar(value="20 ms")
-        self.tb_box = ttk.Combobox(frame, textvariable=self.tb_var, width=8,
-                                   state="readonly",
-                                   values=[n for n, _ in TIMEBASE_CHOICES])
-        self.tb_box.pack(side=tk.LEFT, padx=2)
-        self.tb_box.bind("<<ComboboxSelected>>", self.on_timebase_change)
+        # What the scope actually delivered, measured from the data itself and
+        # refreshed after every capture.
+        self.span_var = tk.StringVar(value="")
+        tk.Label(frame, textvariable=self.span_var, fg="#555555",
+                 font=('Arial', 9)).pack(side=tk.LEFT, padx=(15, 2))
 
         status_frame = tk.Frame(master, bd=1, relief=tk.SUNKEN)
         status_frame.pack(side=tk.BOTTOM, fill=tk.X)
@@ -566,40 +675,79 @@ class App:
             if var.get() not in names:
                 var.set(names[default])
 
-    def sync_timebase_box(self):
-        """Make the combobox show what the scope is actually set to.
+    def update_scope_info(self):
+        """Report the timebase and, when the midpoint probe is present, R.
 
-        Previously the box said '20 ms' while the scope sat at 1 ms/div,
-        because the default value is never pushed to the instrument — only a
-        user selection triggers that. Showing the truth is safer than silently
-        changing the operator's setting on connect.
+        Everything here is measured, not commanded. The record length comes
+        from the waveform preamble and the resistance from the CH3 divider, so
+        this line says what the instrument delivered rather than what anyone
+        asked for.
         """
         if not self.scope or not self.timebase:
+            self.span_var.set("")
             return
         per_div = self.timebase[0] / 10.0
-        name = min(TIMEBASE_CHOICES, key=lambda kv: abs(kv[1] - per_div))[0]
-        self.tb_var.set(name)
-        # A record much shorter than a few hundred cycles cannot show a switch
-        # between scrolls, so flag it here rather than after the capture.
-        if per_div < 5e-3:
-            logger.info("Scope is at %s/div — short records; 20 ms/div "
-                        "recommended for the attractor", name)
+        txt = "timebase %s/div = %s" % (_fmt_time(per_div), _fmt_time(self.timebase[0]))
+        if self.time is not None and len(self.time) > 1:
+            dt = self.time[1] - self.time[0]
+            txt += "  |  %s, %d pts, %.0f kSa/s" % (
+                _fmt_time(self.time[-1] - self.time[0]), len(self.time), 1e-3 / dt)
 
-    def on_timebase_change(self, event=None):
-        """Push the chosen s/div to the scope and refresh the empty grid."""
-        if not self.scope:
-            return
-        name = self.tb_var.get()
-        value = dict(TIMEBASE_CHOICES).get(name)
-        if value is None:
-            return
+        r = self.measure_rpot()
+        if r is not None:
+            rp, resid = r
+            txt += "  |  R = %.1f \u03a9" % rp
+            if resid > 0.05:
+                # CH3 is not behaving as a divider between CH1 and CH2
+                txt += " (poor fit %.0f%% - check the CH3 probe)" % (100 * resid)
+            elif not (0.0 <= rp <= RPOT_MAX):
+                # The fit is clean but the answer is impossible. Almost always
+                # CH1 and CH2 are the wrong way round: v_C1 is the channel with
+                # the larger swing, several volts, while v_C2 stays under a volt.
+                txt += " (out of range - CH1/CH2 swapped?)"
+                logger.warning("Rpot = %.1f ohm is outside 0..%.0f; "
+                               "CH1 should be v_C1 (the larger swing)", rp, RPOT_MAX)
+        self.span_var.set(txt)
+
+        if per_div < 5e-3:
+            logger.info("Scope is at %s/div - short records; 20 ms/div "
+                        "recommended for the attractor", _fmt_time(per_div))
+
+    def measure_rpot(self):
+        """Potentiometer resistance from the CH3 voltage divider.
+
+        R0 and the potentiometer sit in series between the v_C1 and v_C2
+        nodes with CH3 at their junction. No current flows into a scope probe,
+        so that node is a plain divider, v_m = A*v_C1 + B*v_C2 + C, and
+
+            Rpot = R0 * (B/A) * g21
+
+        Using both coefficients rather than A alone cancels the gain of the
+        CH3 input; only the relative gain of the two end channels is left, and
+        that is close to 1 when they share a V/div. The fitted constant C
+        absorbs any DC offset. Returns (Rpot, relative fit residual) or None.
+        """
+        if self.y is None or len(self.chs) < 3:
+            return None
         try:
-            self.scope.set_timebase(value)
-            logger.info("Timebase set to %s (%.6g s/div)", name, value)
-            self.apply_scope_settings()
+            i1, i2, im = (self.chs.index("CH1"), self.chs.index("CH2"),
+                          self.chs.index("CH3"))
+        except ValueError:
+            return None
+        v1, v2, vm = self.y[:, i1], self.y[:, i2], self.y[:, im]
+        try:
+            M = np.column_stack([v1, v2, np.ones_like(v1)])
+            coef, *_ = np.linalg.lstsq(M, vm, rcond=None)
+            A, B, _ = coef
+            if abs(A) < 1e-9:
+                return None
+            resid = float(np.sqrt(np.mean((vm - M @ coef) ** 2)))
+            span = float(vm.max() - vm.min())
+            rp = self.r0 * (B / A) * self.g21
+            return rp, resid / max(span, 1e-12)
         except Exception as e:
-            logger.warning("Could not set timebase: %s", e)
-            messagebox.showwarning("Timebase", str(e))
+            logger.debug("Rpot fit failed: %s", e)
+            return None
 
     def remember_save_path(self, folder):
         """Store the last used folder in config.ini so it survives a restart."""
@@ -821,7 +969,7 @@ class App:
         # three or four channels: common axis in divisions
         self.setup_scope_grid(self.ax, time_per_div=time_per_div, volts_per_div=1.0)
         self.ax.set_ylim(-4, 4)
-        self.ax.set_ylabel("делений от нуля канала")
+        self.ax.set_ylabel("divisions from each channel zero")
         if has_data:
             for i in range(num_ch):
                 d = (self.y_disp[:, i] - self.offsets[i]) / self.scales[i]
@@ -846,12 +994,12 @@ class App:
     def set_connected_status(self, connected, idn_text=""):
         if connected:
             self.scope_idn = idn_text
-            self.status_var.set(f"{idn_text} :מחובר")
+            self.status_var.set(f"Connected: {idn_text}")
             self.status_icon.itemconfig(self.status_circle, fill="green")
             logger.info("Connected: %s", idn_text)
         else:
             self.scope_idn = ""
-            self.status_var.set("לא מחובר")
+            self.status_var.set("Not connected")
             self.save_btn.config(state=tk.DISABLED)
             self.status_icon.itemconfig(self.status_circle, fill="red")
             logger.info("Disconnected")
@@ -859,7 +1007,7 @@ class App:
     # ---------------- connection ----------------
     def reconnect(self):
         logger.info("Searching for oscilloscope...")
-        self.status_var.set("...מחפש אוסצילוסקופ")
+        self.status_var.set("Searching for oscilloscope...")
         self.status_icon.itemconfig(self.status_circle, fill="gray")
         self.master.update_idletasks()
 
@@ -895,7 +1043,7 @@ class App:
             self.scales = s['scales']
             self.time = self.y = self.time_disp = self.y_disp = None
             self.redraw_plot()
-            self.sync_timebase_box()
+            self.update_scope_info()
             logger.info("Scope settings: timebase=%s, channels=%s", self.timebase, self.chs)
         except Exception as e:
             logger.warning("Could not read scope settings: %s", e)
@@ -905,13 +1053,13 @@ class App:
         logger.info("'Capture' pressed")
         if not self.scope:
             if not self.reconnect():
-                messagebox.showwarning("אין חיבור", "לא נמצא אוסצילוסקופ")
+                messagebox.showwarning("No connection", "No oscilloscope found")
                 return
 
         self.is_capturing = True
         self.start_blink()
         self.master.config(cursor="watch")
-        self.status_var.set("...מקבל נתונים")
+        self.status_var.set("Acquiring...")
         self.master.update_idletasks()
 
         try:
@@ -925,19 +1073,37 @@ class App:
             else:
                 self._no_trigger = False
         except Exception as e:
-            logger.warning("Unable to capture data: %s", e)
+            # The link can die between captures (cable, scope power-cycled, a
+            # stuck VISA session). Clear the session, reconnect and try once
+            # more before bothering the operator - during a sweep a dialog on
+            # every hiccup is worse than a two-second delay.
+            logger.warning("Capture failed (%s); clearing session and retrying", e)
             try:
-                self.scope.inst.clear()                    # unstick the VISA session
-                logger.info("VISA session cleared, connection kept")
+                self.scope.inst.clear()
             except Exception:
+                pass
+            ok = False
+            if self.reconnect():
+                try:
+                    self.scope.raw_points = self.raw_points
+                    (self.time, self.y, self.chs, self.offsets,
+                     self.scales, self.timebase, fresh) = \
+                        self.scope.get_trace(deep=self.deep_memory)
+                    self._no_trigger = not fresh
+                    ok = True
+                    logger.info("Retry after reconnect succeeded")
+                except Exception as e2:
+                    logger.warning("Retry after reconnect failed: %s", e2)
+                    e = e2
+            if not ok:
                 self.scope = None
                 self.set_connected_status(False)
-            messagebox.showerror("שגיאה בקריאה", f"{e} :שגיאה")
-            self.is_capturing = False
-            self.stop_blink()
-            self.status_icon.itemconfig(self.status_circle, fill="orange")
-            self.master.config(cursor="")
-            return
+                messagebox.showerror("Read error", str(e))
+                self.is_capturing = False
+                self.stop_blink()
+                self.status_icon.itemconfig(self.status_circle, fill="orange")
+                self.master.config(cursor="")
+                return
 
         self.is_capturing = False
         self.stop_blink()
@@ -978,10 +1144,7 @@ class App:
             logger.debug("Frequency measurement skipped: %s", e)
 
         if cycles is not None and cycles < MIN_PERIODS_WARN:
-            need = MIN_PERIODS_WARN * 10 / f0 / 10          # s/div for MIN_PERIODS_WARN cycles
-            nice = min((v for _, v in TIMEBASE_CHOICES if v >= need),
-                       default=TIMEBASE_CHOICES[-1][1])
-            label = next((n for n, v in TIMEBASE_CHOICES if v == nice), "")
+            need = MIN_PERIODS_WARN / f0 / 10      # s/div for MIN_PERIODS_WARN cycles
             logger.warning("Only %.0f cycles captured", cycles)
             messagebox.showwarning(
                 "Record too short",
@@ -990,12 +1153,13 @@ class App:
                 f"A chaotic attractor needs hundreds of cycles before it switches "
                 f"between lobes, so the XY view will show one scroll even if the "
                 f"scope screen shows two.\n\n"
-                f"Set the timebase to {label or '20 ms'}/div or slower and capture again.")
+                f"Set the scope to {_fmt_time(need)}/div or slower and capture again.")
 
+        self.update_scope_info()      # the front panel may have been turned
         self.master.config(cursor="")
         warn = "⚠ no trigger, frozen memory | " if getattr(self, "_no_trigger", False) else ""
         self.status_var.set(
-            f"{warn}({', '.join(self.chs)}, {len(self.time)} pts) נתונים התקבלו | {self.scope_idn}")
+            f"{warn}captured {', '.join(self.chs)}, {len(self.time)} pts | {self.scope_idn}")
         self.status_icon.itemconfig(self.status_circle,
                                     fill="orange" if warn else "green")
 
@@ -1039,15 +1203,10 @@ class App:
             np.savetxt(file_path, block, delimiter=',', header=header,
                        comments='', fmt='%.6e')
             size_mb = os.path.getsize(file_path) / 1e6
-            # No modal dialog here: saving happens after almost every capture, and
-            # a popup that must be dismissed each time breaks the rhythm of a sweep.
-            # The full path goes to the console and to the status bar instead.
-            logger.info("SAVED  %s  (%d points, %.1f MB)",
-                        file_path, len(self.time), size_mb)
+            logger.info("Saved %s (%d points, %.1f MB)", file_path, len(self.time), size_mb)
             self.remember_save_path(os.path.dirname(file_path))
-            self.status_var.set(
-                f"{os.path.basename(file_path)} \u2713 {len(self.time)} pts, "
-                f"{size_mb:.1f} MB | {self.scope_idn}")
+            messagebox.showinfo("Success",
+                                f"Saved to {file_path}\n{len(self.time)} points, {size_mb:.1f} MB")
         except Exception as e:
             logger.error("File save failed: %s", e)
             messagebox.showerror("Save error", str(e))
@@ -1063,7 +1222,7 @@ class App:
 
 
 if __name__ == "__main__":
-    logger.info("Application started, version %s", VERSION)
+    logger.info("Application started, version %s - %s", VERSION, VERSION_NOTE)
     root = tk.Tk()
     app = App(root)
     root.protocol("WM_DELETE_WINDOW", app.on_close)
