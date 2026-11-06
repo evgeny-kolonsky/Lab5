@@ -41,6 +41,14 @@ Based on the scripts by Anton S. (dp_traj_extract_main.py,
 dp_post_processing.py, dp_extraction_utils.py)
 
 CHANGELOG
+    3.13 single-rod mode: if only the M1 colour is picked and M2 is left
+         unset, the run tracks one rod. theta1, omega1 and the rod length are
+         exported, the geometry steps that need two markers (equal-rod marker
+         offsets, the joint two-marker angle fit) are skipped, and the energy
+         becomes that of one physical pendulum, E = J w^2/2 + m g l (1-cos th),
+         with the parameters of rod 1 or rod 2 as chosen on the Settings tab.
+         This is the mode for the bench measurements each rod is characterised
+         with: the period T and the decay time of its free oscillation
     3.12.1 pendulum settings saved by an older version are no longer reused:
            an INI key is case-insensitive, so the 3.11 line "pend_L1 = 0.255"
            (metres) was read by 3.12 as 0.255 MILLIMETRES, which collapsed the
@@ -115,7 +123,7 @@ CHANGELOG
     1.x  original command line scripts by Anton S.
 """
 
-__version__ = "3.12.1"
+__version__ = "3.13.0"
 
 import configparser
 import os
@@ -171,6 +179,7 @@ DEFAULTS = {
     "pend_m2": "479",          # g
     "pend_J1": "22.5",         # g*m2, about the axis of rod 1
     "pend_J2": "26.3",         # g*m2, about the axis of rod 2
+    "pend_single_rod": "1",    # which rod the single-rod energy belongs to
     "degrees": "1",
     "unwrap": "0",
     "interpolate": "1",
@@ -713,6 +722,18 @@ def total_energy(th1, th2, w1, w2, l1, l2, l3, m1, m2, J1, J2, g=G_DEFAULT):
     return T + V - V0
 
 
+def single_rod_energy(th, w, l, m, J, g=G_DEFAULT):
+    """Energy of ONE rod hanging from its own axis, in joules.
+
+        E = J w^2 / 2 + m g l (1 - cos th)
+
+    J is the moment of inertia about that axis (the quantity a period
+    measurement gives directly) and l the distance from the axis to the centre
+    of mass. Zero is the rod hanging still.
+    """
+    return 0.5 * J * w ** 2 + m * g * l * (1.0 - np.cos(th))
+
+
 def velocity_scale_check(t, th1, th2, w1, w2, pend):
     """Does the energy say the time axis is right?
 
@@ -790,7 +811,7 @@ def frame_angles_deg(origin, p1, p2):
 
 
 def draw_overlay(img, origin, p1, p2, t=None, bad1=False, bad2=False,
-                 th1=None, th2=None, note=""):
+                 th1=None, th2=None, note="", single=False):
     """Draw the two rods, the vertical reference and the angle readout.
 
     A rod whose length is outside the tolerance is drawn in red: those frames
@@ -800,9 +821,19 @@ def draw_overlay(img, origin, p1, p2, t=None, bad1=False, bad2=False,
     cv2.line(img, p0, (p0[0], p0[1] + 140), (170, 170, 170), 1)   # vertical ref
     draw_crosshair(img, p0)
     txt = f"t={t:.3f}s  " if t is not None else ""
-    if p1 is None or p2 is None:
+    if p1 is None or (p2 is None and not single):
         txt += "NO DATA" + ("  " + note if note else "")
         bad1 = bad2 = True
+    elif single:
+        q1 = (int(round(p1[0])), int(round(p1[1])))
+        cv2.line(img, p0, q1, (0, 0, 255) if bad1 else (0, 255, 255), 2)
+        if th1 is None:
+            th1 = np.degrees(np.arctan2(p1[0] - origin[0], p1[1] - origin[1]))
+        txt += f"th1={th1:+.1f} deg"
+        if bad1:
+            txt += "  LENGTH!"
+        if note:
+            txt += "  " + note
     else:
         q1 = (int(round(p1[0])), int(round(p1[1])))
         q2 = (int(round(p2[0])), int(round(p2[1])))
@@ -881,6 +912,7 @@ class TrackerJob(threading.Thread):
                                  min(60.0, cfg["fps"]), size)
         cap.set(cv2.CAP_PROP_POS_FRAMES, start)
         ox, oy = origin
+        single = bool(cfg.get("single", False))
         for i in range(n):
             if self.stop_flag.is_set():
                 break
@@ -897,28 +929,32 @@ class TrackerJob(threading.Thread):
                     gy = int(round(origin_clicked[1] * sc))
                     cv2.line(g, (gx - 7, gy), (gx + 7, gy), (140, 140, 140), 1)
                     cv2.line(g, (gx, gy - 7), (gx, gy + 7), (140, 140, 140), 1)
-                for j, (rx, ry, col) in enumerate((
-                        (raw[0][i], raw[1][i], cfg["color1"]),
-                        (raw[2][i], raw[3][i], cfg["color2"]))):
+                pairs = [(raw[0][i], raw[1][i], cfg["color1"])]
+                if not single:
+                    pairs.append((raw[2][i], raw[3][i], cfg["color2"]))
+                for j, (rx, ry, col) in enumerate(pairs):
                     if raw_found is not None and not raw_found[j][i]:
                         continue
                     if np.isfinite(rx) and np.isfinite(ry):
                         cv2.circle(g, (int(round((origin_clicked[0] + rx) * sc)),
                                        int(round((origin_clicked[1] + ry) * sc))),
                                    max(4, int(8 * sc)), col, 1)
-            ok = np.isfinite(x1[i]) and np.isfinite(x2[i])
+            ok = np.isfinite(x1[i]) and (single or np.isfinite(x2[i]))
             p1 = p2 = None
             if ok:
                 p1 = ((ox + x1[i]) * sc, (oy + y1[i]) * sc)
-                p2 = ((ox + x2[i]) * sc, (oy + y2[i]) * sc)
                 # small filled dot: it must not hide the marker underneath
                 cv2.circle(g, (int(round(p1[0])), int(round(p1[1]))),
                            max(2, int(3 * sc)), cfg["color1"], -1)
-                cv2.circle(g, (int(round(p2[0])), int(round(p2[1]))),
-                           max(2, int(3 * sc)), cfg["color2"], -1)
+                if not single:
+                    p2 = ((ox + x2[i]) * sc, (oy + y2[i]) * sc)
+                    cv2.circle(g, (int(round(p2[0])), int(round(p2[1]))),
+                               max(2, int(3 * sc)), cfg["color2"], -1)
             draw_overlay(g, (ox * sc, oy * sc), p1, p2, t=t[i],
                          bad1=bool(out1[i]), bad2=bool(out2[i]),
-                         th1=a1[i] if ok else None, th2=a2[i] if ok else None)
+                         th1=a1[i] if ok else None,
+                         th2=None if single else (a2[i] if ok else None),
+                         single=single)
             writer.write(g)
             if i % 25 == 0:
                 self.progress_cb(i, max(1, n), -1, -1)
@@ -927,6 +963,9 @@ class TrackerJob(threading.Thread):
 
     def _work(self):
         cfg = self.cfg
+        # single-rod mode: only the M1 colour was picked. One marker means one
+        # angle; everything that needs the second one is skipped below.
+        single = bool(cfg.get("single", False))
         cap = cv2.VideoCapture(cfg["video_path"])
         if not cap.isOpened():
             raise RuntimeError("Could not open the video file.")
@@ -958,8 +997,12 @@ class TrackerJob(threading.Thread):
                  else gate0 * (1 + miss[i]) for i in (0, 1)]
             cx1, cy1, f1, b1 = detect_color(frame, cfg["filt1"], cfg["min_size"],
                                             hsv, prev[0], g[0])
-            cx2, cy2, f2, b2 = detect_color(frame, cfg["filt2"], cfg["min_size"],
-                                            hsv, prev[1], g[1])
+            if single:
+                cx2, cy2, f2 = np.nan, np.nan, False
+            else:
+                cx2, cy2, f2, b2 = detect_color(frame, cfg["filt2"],
+                                                cfg["min_size"], hsv,
+                                                prev[1], g[1])
             for i, (fd, pos) in enumerate(((f1, (cx1, cy1)), (f2, (cx2, cy2)))):
                 if fd:
                     prev[i], miss[i] = pos, 0
@@ -1073,15 +1116,18 @@ class TrackerJob(threading.Thread):
             ref1 = float(np.median(len1[f1]))
         if (f1 & f2).any():
             ref2 = float(np.median(len2[f1 & f2]))
+        if single:
+            ref2 = ref1 or 1.0          # never used, but keeps the maths finite
         if not ref1 or not ref2:
-            raise RuntimeError("Could not establish the rod lengths - the masses "
-                               "are almost never detected.")
+            raise RuntimeError("Could not establish the rod length%s - the "
+                               "mass%s almost never detected."
+                               % (("", " is") if single else ("s", "es are")))
 
         ok1 = f1 & (np.abs(len1 - ref1) <= tol * ref1)
         ok2 = f2 & (np.abs(len2 - ref2) <= tol * ref2)
 
         if cfg["interpolate"]:
-            if ok1.sum() < 2 or ok2.sum() < 2:
+            if ok1.sum() < 2 or (not single and ok2.sum() < 2):
                 raise RuntimeError(
                     "Too few valid frames (M1: %d, M2: %d out of %d). Check the "
                     "colour selection, the filter margins and the rod length "
@@ -1091,17 +1137,21 @@ class TrackerJob(threading.Thread):
             gap = cfg.get("max_gap", 5)
             x1 = interp_with_gap_limit(t, ok1, x1, gap)
             y1 = interp_with_gap_limit(t, ok1, y1, gap)
-            len2 = np.hypot(x2 - x1, y2 - y1)
-            ok2 = f2 & (np.abs(len2 - ref2) <= tol * ref2)
-            if ok2.sum() < 2:
-                raise RuntimeError("Too few valid frames for M2 after repairing "
-                                   "M1. Check the tolerance and the margins.")
-            x2 = interp_with_gap_limit(t, ok2, x2, gap)
-            y2 = interp_with_gap_limit(t, ok2, y2, gap)
+            if not single:
+                len2 = np.hypot(x2 - x1, y2 - y1)
+                ok2 = f2 & (np.abs(len2 - ref2) <= tol * ref2)
+                if ok2.sum() < 2:
+                    raise RuntimeError("Too few valid frames for M2 after "
+                                       "repairing M1. Check the tolerance and "
+                                       "the margins.")
+                x2 = interp_with_gap_limit(t, ok2, x2, gap)
+                y2 = interp_with_gap_limit(t, ok2, y2, gap)
 
         # ---- equalise the rod lengths by fitting the marker offsets --------
         marker_note = "marker offsets: not fitted"
-        if cfg.get("equal_rods", True):
+        if single:
+            marker_note = "marker offsets: single rod, nothing to equalise"
+        elif cfg.get("equal_rods", True):
             # A hand-placed marker is off by a pixel or two, which shows up as a
             # length difference of a per cent or so. A big difference means the
             # rods are simply NOT equal - forcing them together would corrupt
@@ -1147,7 +1197,13 @@ class TrackerJob(threading.Thread):
         # bound (and every mis-detection near the top adds a spurious turn).
         # ---- angles: geometric refinement, then temporal smoothing ---------
         win_probe = 5
-        if cfg.get("joint_fit", True):
+        if single:
+            # one marker: the angle is simply where it sits, and a radial
+            # projection onto the circle of radius L cannot change it
+            raw1 = np.arctan2(x1, y1)
+            raw2 = np.full_like(raw1, np.nan)
+            fit_note = "angles: single rod, theta1 from M1 alone"
+        elif cfg.get("joint_fit", True):
             # weight each marker by the scatter it actually shows: the noise of
             # M1 and M2 is neither equal nor white on real footage
             def hf(arr):
@@ -1200,16 +1256,26 @@ class TrackerJob(threading.Thread):
         # biases the potential energy linearly in theta, which shows up as an
         # energy beat at the swing frequency.
         z1, z2 = cfg.get("zero_deg", (0.0, 0.0))
-        zero_note = (f"angle zero: subtracted {z1:+.2f} / {z2:+.2f} deg"
-                     if (z1 or z2) else "angle zero: not corrected")
-        if z1 or z2:
-            s1 = s1 - np.radians(z1)
-            s2 = s2 - np.radians(z2)
-        with np.errstate(invalid="ignore"):
-            zero_note += (f"; mean angle over the run "
-                          f"{np.degrees(np.nanmean(s1)):+.2f} / "
-                          f"{np.degrees(np.nanmean(s2)):+.2f} deg "
-                          f"(should be near zero for a free decay)")
+        if single:
+            zero_note = (f"angle zero: subtracted {z1:+.2f} deg" if z1
+                         else "angle zero: not corrected")
+            if z1:
+                s1 = s1 - np.radians(z1)
+            with np.errstate(invalid="ignore"):
+                zero_note += (f"; mean angle over the run "
+                              f"{np.degrees(np.nanmean(s1)):+.2f} deg "
+                              f"(should be near zero for a free decay)")
+        else:
+            zero_note = (f"angle zero: subtracted {z1:+.2f} / {z2:+.2f} deg"
+                         if (z1 or z2) else "angle zero: not corrected")
+            if z1 or z2:
+                s1 = s1 - np.radians(z1)
+                s2 = s2 - np.radians(z2)
+            with np.errstate(invalid="ignore"):
+                zero_note += (f"; mean angle over the run "
+                              f"{np.degrees(np.nanmean(s1)):+.2f} / "
+                              f"{np.degrees(np.nanmean(s2)):+.2f} deg "
+                              f"(should be near zero for a free decay)")
 
         if cfg.get("unwrap", False):
             th1, th2 = s1, s2
@@ -1217,13 +1283,20 @@ class TrackerJob(threading.Thread):
             th1 = (s1 + np.pi) % (2 * np.pi) - np.pi
             th2 = (s2 + np.pi) % (2 * np.pi) - np.pi
 
-        jump = tuple(float(np.nanmax(np.abs(np.diff(u)))) if k > 1 else 0.0
-                     for u in (u1, u2))
-        rods = ((float(np.nanmean(len1)), float(np.nanmin(len1)),
-                 float(np.nanmax(len1))),
-                (float(np.nanmean(len2)), float(np.nanmin(len2)),
-                 float(np.nanmax(len2))))
-        n_nan = int(np.sum(~np.isfinite(x1) | ~np.isfinite(x2)))
+        def _max_step(u):
+            d = np.abs(np.diff(u[np.isfinite(u)])) if np.isfinite(u).sum() > 1 \
+                else np.empty(0)
+            return float(d.max()) if d.size else 0.0
+        jump = (_max_step(u1), _max_step(u2))
+        with np.errstate(invalid="ignore", all="ignore"):
+            rod1 = (float(np.nanmean(len1)), float(np.nanmin(len1)),
+                    float(np.nanmax(len1)))
+            rod2 = ((np.nan, np.nan, np.nan) if single or not np.isfinite(len2).any()
+                    else (float(np.nanmean(len2)), float(np.nanmin(len2)),
+                          float(np.nanmax(len2))))
+        rods = (rod1, rod2)
+        n_nan = int(np.sum(~np.isfinite(x1))) if single else \
+            int(np.sum(~np.isfinite(x1) | ~np.isfinite(x2)))
 
         # ---- energy (optional, needs the pendulum parameters) --------------
         pend = cfg.get("pendulum") or {}
@@ -1231,7 +1304,20 @@ class TrackerJob(threading.Thread):
         time_warning = ""
         window_note = ""
         energy_note = "energy: pendulum parameters not set"
-        if pend and pend.get("l3") and pend.get("m1"):
+        if single and pend:
+            which = str(pend.get("srod", "1"))
+            l_, m_, J_ = ((pend["l1"], pend["m1"], pend["J1"]) if which == "1"
+                          else (pend["l2"], pend["m2"], pend["J2"]))
+            energy = single_rod_energy(s1, w1, l_, m_, J_, pend["g"])
+            fin = np.isfinite(energy)
+            energy_note = (f"energy: single rod {which} - l={1000*l_:.0f} mm, "
+                           f"m={1000*m_:.0f} g, I={1000*J_:.1f} g*m2 about its "
+                           f"axis; E from {np.min(energy[fin]):.4f} to "
+                           f"{np.max(energy[fin]):.4f} J"
+                           if fin.any() else "energy: not computable")
+        elif single:
+            energy_note = "energy: pendulum parameters not set"
+        elif pend and pend.get("l3") and pend.get("m1"):
             energy = total_energy(s1, s2, w1, w2, pend["l1"], pend["l2"],
                                   pend["l3"], pend["m1"], pend["m2"],
                                   pend["J1"], pend["J2"], pend["g"])
@@ -1302,14 +1388,24 @@ class TrackerJob(threading.Thread):
         suffix = "_deg" if cfg["degrees"] else "_rad"
         wsuffix = "_deg_s" if cfg["degrees"] else "_rad_s"
 
-        data = {
-            "Time": t, "X1": x1, "Y1": y1, "X2": x2, "Y2": y2,
-            "theta1" + suffix: th1, "theta2" + suffix: th2,
-            "omega1" + wsuffix: w1o, "omega2" + wsuffix: w2o,
-        }
-        if energy is not None:
-            data["E_J"] = energy
-        data.update({"L1": len1, "L2": len2, "L1_out": out1, "L2_out": out2})
+        if single:
+            # one marker, one angle: the M2 columns would be all-empty, so they
+            # are not written at all
+            data = {"Time": t, "X1": x1, "Y1": y1,
+                    "theta1" + suffix: th1, "omega1" + wsuffix: w1o}
+            if energy is not None:
+                data["E_J"] = energy
+            data.update({"L1": len1, "L1_out": out1})
+        else:
+            data = {
+                "Time": t, "X1": x1, "Y1": y1, "X2": x2, "Y2": y2,
+                "theta1" + suffix: th1, "theta2" + suffix: th2,
+                "omega1" + wsuffix: w1o, "omega2" + wsuffix: w2o,
+            }
+            if energy is not None:
+                data["E_J"] = energy
+            data.update({"L1": len1, "L2": len2,
+                         "L1_out": out1, "L2_out": out2})
         df = pd.DataFrame(data)
         # ---- control video, written in a SECOND pass -----------------------
         # The origin correction, the marker offsets, the interpolation and the
@@ -1326,7 +1422,7 @@ class TrackerJob(threading.Thread):
             wrote_video = True
 
         return {
-            "df": df, "n_frames": k,
+            "df": df, "n_frames": k, "single": single,
             "len_ref": (ref1, ref2), "len_tol": tol * 100.0,
             "len_ref_frame": (ref1_frame or 0.0, ref2_frame or 0.0),
             "n_out": (int(out1.sum()), int(out2.sum())),
@@ -1339,8 +1435,10 @@ class TrackerJob(threading.Thread):
             "expected_frames": expected,
             "found1": int(f1.sum()), "found2": int(f2.sum()),
             "units": "deg" if cfg["degrees"] else "rad",
-            "cols": ("theta1" + suffix, "theta2" + suffix),
-            "wcols": ("omega1" + wsuffix, "omega2" + wsuffix),
+            "cols": (("theta1" + suffix,) if single else
+                     ("theta1" + suffix, "theta2" + suffix)),
+            "wcols": (("omega1" + wsuffix,) if single else
+                      ("omega1" + wsuffix, "omega2" + wsuffix)),
             "has_energy": energy is not None,
             "fit_note": fit_note, "energy_note": energy_note,
             "track_video": cfg["video_out_path"] if wrote_video else None,
@@ -1349,6 +1447,8 @@ class TrackerJob(threading.Thread):
             "unwrapped": bool(cfg.get("unwrap", False)),
             "turns2": (float((u2[np.isfinite(u2)][-1] - u2[np.isfinite(u2)][0])
                              / (2 * np.pi)) if np.isfinite(u2).sum() > 1 else 0.0),
+            "turns1": (float((u1[np.isfinite(u1)][-1] - u1[np.isfinite(u1)][0])
+                             / (2 * np.pi)) if np.isfinite(u1).sum() > 1 else 0.0),
         }
 
 
@@ -1546,8 +1646,11 @@ class App(tk.Tk):
         self.lbl_m1.pack(anchor="w")
         ttk.Button(m, text="Select M2 (drag a box)",
                    command=lambda: self.set_mode("m2")).pack(fill="x", pady=1)
-        self.lbl_m2 = ttk.Label(m, text="M2: not set", foreground="#a00")
+        self.lbl_m2 = ttk.Label(m, text="M2: not set (single rod)",
+                                foreground="#a60")
         self.lbl_m2.pack(anchor="w")
+        ttk.Button(m, text="Forget M2 (track a single rod)",
+                   command=self.clear_m2).pack(fill="x", pady=1)
         self.lbl_rods = ttk.Label(m, text="", wraplength=270, foreground="#555")
         self.lbl_rods.pack(anchor="w")
 
@@ -1670,6 +1773,13 @@ class App(tk.Tk):
                                                                sticky="w", pady=1)
         ttk.Entry(grid, textvariable=self.var_pl3, width=9).grid(row=4, column=1,
                                                                  padx=2)
+        srow = ttk.Frame(b)
+        srow.pack(fill="x", pady=(4, 0))
+        ttk.Label(srow, text="single-rod run uses:").pack(side="left")
+        self.var_srod = tk.StringVar(value=self.cfg.get("pend_single_rod", "1"))
+        for lab, val in (("rod 1", "1"), ("rod 2", "2")):
+            ttk.Radiobutton(srow, text=lab, value=val,
+                            variable=self.var_srod).pack(side="left", padx=4)
         hint(b, "All four quantities are measured with one rod at a time: the "
                 "mass, the distance from its own axis to its centre of mass "
                 "(balance it on a knife edge), and the moment of inertia about "
@@ -1679,7 +1789,12 @@ class App(tk.Tk):
                 f"Gravity is fixed at {G_DEFAULT} m/s2. Zero of energy = both "
                 "rods hanging at rest. E_J goes into the CSV and into the "
                 "Energy plot; a smooth curve with a slow decay means the "
-                "tracking is sound.")
+                "tracking is sound.\n"
+                "With only the M1 colour picked the run tracks a SINGLE rod and "
+                "the energy becomes E = I w^2/2 + m g l (1 - cos th) of that "
+                "one rod - the choice above says whose l, m and I to use. That "
+                "is the measurement each rod is characterised with before the "
+                "pendulum is assembled.")
 
         b = block(where(1, 1), "Kinematic post-processing")
         self.var_joint = tk.BooleanVar(value=self.cfg["joint_fit"] == "1")
@@ -1788,6 +1903,7 @@ class App(tk.Tk):
             "pend_m2": self.var_pm2.get(),
             "pend_J1": self.var_pJ1.get(),
             "pend_J2": self.var_pJ2.get(),
+            "pend_single_rod": self.var_srod.get(),
             "degrees": "1" if self.var_deg.get() else "0",
             "unwrap": "1" if self.var_unwrap.get() else "0",
             "interpolate": "1" if self.var_interp.get() else "0",
@@ -1853,7 +1969,7 @@ class App(tk.Tk):
         self.lbl_saved.config(text="")
         self.lbl_origin.config(text="origin: not set", foreground="#a00")
         self.lbl_m1.config(text="M1: not set", foreground="#a00")
-        self.lbl_m2.config(text="M2: not set", foreground="#a00")
+        self.lbl_m2.config(text="M2: not set (single rod)", foreground="#a60")
         self.lbl_start.config(text="start: frame 0")
         self.lbl_video.config(text=os.path.basename(path))
         self.zoom_reset(render=False)
@@ -1862,7 +1978,8 @@ class App(tk.Tk):
         self.play_fps, _n = playback_fps(path)
         self.update_fps_check()
         self.set_status(f"{os.path.basename(path)} - {self.n_frames} frames. "
-                        f"Set the origin, the start frame and both marker colours.")
+                        f"Set the origin, the start frame and the marker "
+                        f"colours (M2 may be left unset for a single rod).")
 
     def set_view(self, which):
         """Switch between the source video and the generated control video."""
@@ -2185,8 +2302,18 @@ class App(tk.Tk):
         if self.video_path is None:
             messagebox.showinfo("No video", "Open a video file first.")
             return
-        if self.hsv1 is None or self.hsv2 is None:
-            messagebox.showinfo("No colours", "Select both masses with a box.")
+        if self.hsv1 is None:
+            messagebox.showinfo("No colour",
+                                "Select at least the M1 mass with a box.")
+            return
+        single = self.hsv2 is None
+        if single and not messagebox.askyesno(
+                "Single rod",
+                "Only the M1 colour is set.\n\nTrack a SINGLE ROD? Then "
+                "theta1, omega1 and the rod length are exported, and the energy "
+                "is that of one physical pendulum with the parameters of the rod "
+                "chosen on the Settings tab.\n\nAnswer No to go back and pick "
+                "the M2 colour as well."):
             return
         if self.origin is None:
             if not messagebox.askyesno(
@@ -2205,15 +2332,16 @@ class App(tk.Tk):
         hm, sm, vm = self.var_h.get(), self.var_s.get(), self.var_v.get()
         out_vid = (os.path.splitext(self.video_path)[0] + "_tracking.mp4"
                    if self.var_outvid.get() else "")
-        ref = self.measure_rods(build_filter(self.hsv1, hm, sm, vm),
-                                build_filter(self.hsv2, hm, sm, vm))
+        filt2 = None if single else build_filter(self.hsv2, hm, sm, vm)
+        ref = self.measure_rods(build_filter(self.hsv1, hm, sm, vm), filt2)
         cfg = {
             "video_path": self.video_path,
             "start_frame": self.start_frame,
             "fps": self.get_fps(),
             "origin": self.origin,
             "filt1": build_filter(self.hsv1, hm, sm, vm),
-            "filt2": build_filter(self.hsv2, hm, sm, vm),
+            "filt2": filt2,
+            "single": single,
             "min_size": self.var_min.get(),
             "gate": self.var_gate.get(),
             "len_tol": self.var_lentol.get(),
@@ -2257,6 +2385,7 @@ class App(tk.Tk):
                  "m2": float(self.var_pm2.get()) / 1000.0,
                  "J1": float(self.var_pJ1.get()) / 1000.0,
                  "J2": float(self.var_pJ2.get()) / 1000.0,
+                 "srod": self.var_srod.get(),
                  "g": G_DEFAULT}
         except ValueError:
             return None
@@ -2337,10 +2466,10 @@ class App(tk.Tk):
 
     def set_angle_zero(self):
         """Measure the angular zero on the current frame (rods at rest)."""
-        if self.frame is None or self.hsv1 is None or self.hsv2 is None:
+        if self.frame is None or self.hsv1 is None:
             messagebox.showinfo("Not ready",
-                                "Open a video, set the origin and both marker "
-                                "colours first, then park the slider on a frame "
+                                "Open a video, set the origin and the marker "
+                                "colour(s) first, then park the slider on a frame "
                                 "where the pendulum hangs still.")
             return
         if self.origin is None:
@@ -2348,8 +2477,23 @@ class App(tk.Tk):
             return
         hm, sm, vm = self.var_h.get(), self.var_s.get(), self.var_v.get()
         f1 = build_filter(self.hsv1, hm, sm, vm)
-        f2 = build_filter(self.hsv2, hm, sm, vm)
         cx1, cy1, ok1, _b = detect_color(self.frame, f1, self.var_min.get())
+        if self.hsv2 is None:                   # single rod: only theta1
+            if not ok1:
+                messagebox.showwarning("Not detected",
+                                       "M1 must be visible on this frame.")
+                return
+            z1 = float(np.degrees(np.arctan2(cx1 - self.origin[0],
+                                             cy1 - self.origin[1])))
+            self.var_z1.set(f"{z1:.2f}")
+            self.lbl_zero.config(text=f"angle zero: {z1:+.2f} deg "
+                                      f"(frame {self.cur_idx}, single rod)",
+                                 foreground="#070")
+            self.set_status(f"Angle zero taken from frame {self.cur_idx}: "
+                            f"{z1:+.2f} deg. Make sure the rod was really at "
+                            f"rest there.")
+            return
+        f2 = build_filter(self.hsv2, hm, sm, vm)
         cx2, cy2, ok2, _b = detect_color(self.frame, f2, self.var_min.get())
         if not (ok1 and ok2):
             messagebox.showwarning("Not detected",
@@ -2363,6 +2507,14 @@ class App(tk.Tk):
         self.set_status(f"Angle zero taken from frame {self.cur_idx}: "
                         f"{z1:+.2f} / {z2:+.2f} deg. Make sure the pendulum was "
                         f"really at rest there.")
+
+    def clear_m2(self):
+        """Drop the M2 colour: the next run tracks one rod only."""
+        self.hsv2 = None
+        self.lbl_m2.config(text="M2: not set (single rod)", foreground="#a60")
+        self.set_status("M2 cleared - the next run will track a single rod "
+                        "(theta1, omega1 and the rod length).")
+        self.render()
 
     def measure_rods(self, filt1, filt2):
         """Reference rod lengths, measured on the start (marking) frame.
@@ -2379,6 +2531,16 @@ class App(tk.Tk):
         if not ret:
             return (None, None)
         cx1, cy1, f1, _b = detect_color(frame, filt1, self.var_min.get())
+        if filt2 is None:                       # single rod
+            if not f1:
+                self.set_status("Warning: M1 was not detected on the marking "
+                                "frame; the rod length falls back to the median.")
+                return (None, None)
+            ox, oy = self.origin
+            l1 = float(np.hypot(cx1 - ox, cy1 - oy))
+            self.lbl_rods.config(text=f"single rod on the marking frame: "
+                                      f"L1={l1:.1f} px")
+            return (l1, None)
         cx2, cy2, f2, _b = detect_color(frame, filt2, self.var_min.get())
         if not (f1 and f2):
             self.set_status("Warning: the masses were not detected on the marking "
@@ -2415,29 +2577,45 @@ class App(tk.Tk):
             self.result = result
             self.progress["value"] = self.progress["maximum"]
             n = result["n_frames"]
+            single = result.get("single", False)
             j1, j2 = result["max_jump_deg"]
             (m1, lo1, hi1), (m2, lo2, hi2) = result["rods"]
-            head = ""
+            head = "SINGLE ROD.  " if single else ""
             if result["aborted"]:
                 head = "RUN ABORTED (partial data!)  "
             elif result["truncated"]:
                 head = (f"DECODING STOPPED EARLY: {n} of "
                         f"{result['expected_frames']} frames!  ")
-            msg = (head +
-                   f"Done: {n} frames; M1 detected in {result['found1']} "
-                   f"({100*result['found1']/n:.1f}%), M2 in {result['found2']} "
-                   f"({100*result['found2']/n:.1f}%); max angle step per frame "
-                   f"{j1:.1f} / {j2:.1f} deg; rod lengths "
-                   f"{m1:.0f} ({lo1:.0f}-{hi1:.0f}) / "
-                   f"{m2:.0f} ({lo2:.0f}-{hi2:.0f}) px.")
+            if single:
+                msg = (head +
+                       f"Done: {n} frames; M1 detected in {result['found1']} "
+                       f"({100*result['found1']/n:.1f}%); max angle step per "
+                       f"frame {j1:.1f} deg; rod length "
+                       f"{m1:.0f} ({lo1:.0f}-{hi1:.0f}) px.")
+                j2 = 0.0
+            else:
+                msg = (head +
+                       f"Done: {n} frames; M1 detected in {result['found1']} "
+                       f"({100*result['found1']/n:.1f}%), M2 in {result['found2']} "
+                       f"({100*result['found2']/n:.1f}%); max angle step per frame "
+                       f"{j1:.1f} / {j2:.1f} deg; rod lengths "
+                       f"{m1:.0f} ({lo1:.0f}-{hi1:.0f}) / "
+                       f"{m2:.0f} ({lo2:.0f}-{hi2:.0f}) px.")
             if max(j1, j2) > 90:
                 msg += ("  WARNING: angle steps near 180 deg - the frame rate is "
                         "too low.")
             o1, o2 = result["n_out"]
             r1, r2 = result["len_ref"]
-            msg += (f"  Rod length check (+/-{result['len_tol']:.0f}% of the "
-                    f"median L1={r1:.1f}, L2={r2:.1f} px): out of tolerance in "
-                    f"{o1} / {o2} frames ({100*o1/n:.1f}% / {100*o2/n:.1f}%).")
+            if single:
+                o2 = 0
+                msg += (f"  Rod length check (+/-{result['len_tol']:.0f}% of the "
+                        f"median L1={r1:.1f} px): out of tolerance in {o1} "
+                        f"frames ({100*o1/n:.1f}%).")
+            else:
+                msg += (f"  Rod length check (+/-{result['len_tol']:.0f}% of the "
+                        f"median L1={r1:.1f}, L2={r2:.1f} px): out of tolerance "
+                        f"in {o1} / {o2} frames "
+                        f"({100*o1/n:.1f}% / {100*o2/n:.1f}%).")
             if max(o1, o2) > 0.1 * n:
                 msg += ("  WARNING: more than 10% of the frames are mis-detected "
                         "- adjust the filter margins or the tolerance.")
@@ -2460,9 +2638,12 @@ class App(tk.Tk):
                     "The run did not cover the whole video:\n\n" + head.strip() +
                     "\n\nThe data are usable but partial - the saved file name "
                     "gets a _PARTIAL suffix.")
-            if result["unwrapped"] and abs(result["turns2"]) > 0.5:
+            if result["unwrapped"] and not single and abs(result["turns2"]) > 0.5:
                 msg += (f"  Note: rod 2 winds {result['turns2']:+.1f} turns; with "
                         "unwrapping on, theta2 leaves the +/-180 deg range.")
+            if result["unwrapped"] and single and abs(result.get("turns1", 0)) > 0.5:
+                msg += (f"  Note: the rod winds {result['turns1']:+.1f} turns; "
+                        "with unwrapping on, theta1 leaves the +/-180 deg range.")
             self.set_status(msg)
             self.btn_save.config(state="normal")
             self.btn_plot.config(state="normal")
@@ -2521,12 +2702,29 @@ class App(tk.Tk):
         """
         import datetime
         r = self.result
+        single = r.get("single", False)
         lines = [
             f"dp_gui.py version : {__version__}",
             f"written           : {datetime.datetime.now().isoformat(timespec='seconds')}",
             f"source video      : {self.video_path}",
+            f"mode              : " + ("SINGLE ROD (only M1 tracked)"
+                                       if single else "double pendulum"),
             "",
             f"frames processed  : {r['n_frames']} (start frame {self.start_frame})",
+        ]
+        if single:
+            lines += [
+                f"detected M1       : {r['found1']}",
+                f"length out of tol : {r['n_out'][0]}",
+                f"left empty (NaN)  : {r['n_nan']}",
+                f"rod ref L1        : {r['len_ref'][0]:.2f} px"
+                f"  (median over the run, tolerance {r['len_tol']:.1f}%)",
+                f"  on the marking frame: {r['len_ref_frame'][0]:.2f} px "
+                f"(reference only)",
+                f"max angle step    : {r['max_jump_deg'][0]:.2f} deg per frame",
+            ]
+        else:
+            lines += [
             f"detected M1 / M2  : {r['found1']} / {r['found2']}",
             f"length out of tol : {r['n_out'][0]} / {r['n_out'][1]}",
             f"left empty (NaN)  : {r['n_nan']}",
@@ -2536,6 +2734,8 @@ class App(tk.Tk):
             f"{r['len_ref_frame'][1]:.2f} px (reference only)",
             f"max angle step    : {r['max_jump_deg'][0]:.2f} / "
             f"{r['max_jump_deg'][1]:.2f} deg per frame",
+            ]
+        lines += [
             f"origin clicked    : {self.origin[0]:.2f}, {self.origin[1]:.2f} px",
             f"origin correction : {r['origin_shift'][0]:+.2f}, "
             f"{r['origin_shift'][1]:+.2f} px",
@@ -2559,7 +2759,19 @@ class App(tk.Tk):
                          f"{r['expected_frames']} frames")
         lines += ["", "settings:"]
         lines += [f"  {k:14s} = {v}" for k, v in sorted(self.collect_config().items())]
-        lines += [
+        if single:
+            lines += [
+                "",
+                "columns: Time [s]; X1,Y1 [px] from the origin, image axes "
+                "(y down); theta1 from the downward vertical, + to the right;",
+                "         omega1 angular velocity from the same local "
+                "polynomial fit; E_J energy of the single rod, zero = hanging "
+                "at rest;",
+                "         L1 rod length [px]; L1_out = 1 where the length left "
+                "the tolerance band (mis-detected frame).",
+            ]
+        else:
+            lines += [
             "",
             "columns: Time [s]; X1,Y1,X2,Y2 [px] from the origin, image axes "
             "(y down); theta1,theta2 from the downward vertical, + to the right;",
@@ -2567,6 +2779,8 @@ class App(tk.Tk):
             "polynomial fit; E_J total energy, zero = both rods hanging at rest;",
             "         L1,L2 rod lengths [px]; L1_out,L2_out = 1 where the length "
             "left the tolerance band (mis-detected frame).",
+            ]
+        lines += [
             "",
             "read with:  pandas.read_csv(path, comment='#')",
             "            numpy.genfromtxt(path, delimiter=',', names=True, "
@@ -2592,16 +2806,23 @@ class App(tk.Tk):
         from matplotlib.backends.backend_agg import FigureCanvasAgg
         df = self.result["df"]
         u = self.result["units"]
-        c1, c2 = self.result["cols"]
+        cols = self.result["cols"]
+        single = self.result.get("single", False)
+        c1 = cols[0]
+        c2 = cols[1] if len(cols) > 1 else None
         # constrained layout instead of tight_layout(): the latter needs a
         # renderer, and on a bare Figure it can raise - which is what silently
         # killed the plot window
         fig = Figure(figsize=(8, 5), dpi=100, layout="constrained")
         FigureCanvasAgg(fig)          # a real canvas from the start
+        if single:
+            w1 = self.result["wcols"][0]
+            panes = ((c1, f"$\\theta_1$ [{u}]"), (w1, f"$\\omega_1$ [{u}/s]"))
+        else:
+            panes = ((c1, f"$\\theta_1$ [{u}]"), (c2, f"$\\theta_2$ [{u}]"))
         ax1 = fig.add_subplot(2, 1, 1)
         ax2 = fig.add_subplot(2, 1, 2, sharex=ax1)
-        for a, col, lab in ((ax1, c1, f"$\\theta_1$ [{u}]"),
-                            (ax2, c2, f"$\\theta_2$ [{u}]")):
+        for a, (col, lab) in zip((ax1, ax2), panes):
             a.plot(df.Time, df[col], color="tab:blue", lw=1)
             a.set_ylabel(lab)
             a.grid(alpha=.4)
@@ -2611,10 +2832,12 @@ class App(tk.Tk):
             mark = "  [RUN ABORTED - PARTIAL DATA]"
         elif self.result.get("truncated"):
             mark = "  [DECODING STOPPED EARLY - PARTIAL DATA]"
+        ic = (f"IC: $\\theta_1$={df[c1].iloc[0]:.2f} [{u}], single rod"
+              if single else
+              f"IC: $\\theta_1$={df[c1].iloc[0]:.2f}, "
+              f"$\\theta_2$={df[c2].iloc[0]:.2f} [{u}]")
         fig.suptitle(f"{os.path.basename(self.video_path)}{mark}   "
-                     f"(dp_gui {__version__})\n"
-                     f"IC: $\\theta_1$={df[c1].iloc[0]:.2f}, "
-                     f"$\\theta_2$={df[c2].iloc[0]:.2f} [{u}]")
+                     f"(dp_gui {__version__})\n" + ic)
         return fig
 
     def _energy_figure(self):
