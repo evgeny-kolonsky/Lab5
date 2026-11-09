@@ -6,7 +6,7 @@ dp_flipmap.py  --  map of the time to the first flip (TTFF) of a double
 
 Both rods are released from rest at (theta1_0, theta2_0) and the clock runs
 until the lower rod goes over the top of its own axle. The darker the pixel,
-the sooner that happened; white means it never happened inside the horizon.
+the sooner that happened.
 
 The white region in the middle is not dynamics but arithmetic: a flip needs
 more energy than lifting the lower rod over its axle costs,
@@ -16,6 +16,24 @@ more energy than lifting the lower rod over its axle costs,
 and the black curve drawn on the map is exactly that boundary. It should land
 on the edge of the white region, which is a free check that the map is right.
 Around it the flip time is fractal.
+
+THE ENERGY CUT.  The same inequality is worth far more than a check. Friction
+can only take energy out, so once the total energy of a running pendulum has
+fallen below 2 e2 that pendulum can never flip again - not at this horizon,
+not at any horizon. There is no point integrating it any further. The map
+therefore drops such points as soon as they cross the floor, and three good
+things follow:
+
+  * the run is several times faster, because with realistic friction nearly
+    everything settles below the floor within half a minute;
+  * "never flips" becomes a proof rather than a statement about the horizon
+    you happened to choose, and the map says which of the two it is for every
+    pixel (column `verdict` in the CSV);
+  * points whose STARTING energy is already below the floor are never
+    integrated at all, friction or no friction.
+
+Pass --no-energy-cut to switch the optimisation off and reproduce the old
+brute-force behaviour.
 
 The pendulum is described in config.ini (see README.md), the same bench
 measurements dp_sim.py uses - friction included, so a run with no friction is
@@ -43,7 +61,7 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.ini")
 sys.path.insert(0, APP_DIR)
 
-__version__ = "1.3.0"
+__version__ = "1.4.0"
 
 # --------------------------------------------------------------------------
 #  configuration
@@ -56,8 +74,8 @@ DEFAULTS = {
     "l3": "0.255",      # m     axis of rod 1 -> axis of rod 2
     "T1": "1.000",      # s     period of small swings, rod 1 hanging alone
     "T2": "1.000",      # s     the same for rod 2
-    "half1": "30",      # s     time for that free decay to halve in amplitude
-    "half2": "30",      # s     0 in both switches the friction off
+    "half1": "9.5",     # s     time for that free decay to halve in amplitude
+    "half2": "0",       # s     0 in both switches the friction off
     "g": "9.8",         # m/s2
 }
 
@@ -163,6 +181,25 @@ def normal_modes(p):
     return np.sqrt(np.maximum(w2, 0.0))
 
 
+def energy(y, p):
+    """Total energy of every row of y, zero when both rods hang straight down.
+
+    No unknowns enter it, and with friction it can only fall - which is what
+    makes the energy cut below exact rather than a heuristic.
+    """
+    a, b, d, e1, e2 = coefficients(p)
+    th1, th2, w1, w2 = y[:, 0], y[:, 1], y[:, 2], y[:, 3]
+    return (0.5 * a * w1 ** 2 + 0.5 * d * w2 ** 2
+            + b * w1 * w2 * np.cos(th1 - th2)
+            + e1 * (1.0 - np.cos(th1)) + e2 * (1.0 - np.cos(th2)))
+
+
+def flip_floor(p):
+    """Least energy a flip of the lower rod can possibly cost: lift it over
+    its own axle with the upper rod left hanging, 2 e2."""
+    return 2.0 * coefficients(p)[4]
+
+
 def make_rhs(p):
     """RK4 right-hand side for MANY pendulums at once; y has shape (N, 4)."""
     a, b, d, e1, e2 = coefficients(p)
@@ -190,35 +227,77 @@ def make_rhs(p):
     return rhs
 
 
-def flip_times(y, p, horizon, dt, which=2):
-    """First time |theta| passes pi, for every row of y; inf if it never does.
+def _over_the_top(y, which):
+    return (np.abs(y[:, 1]) > np.pi) if which == 2 else \
+           (np.abs(y[:, 0]) > np.pi) if which == 1 else \
+           ((np.abs(y[:, 0]) > np.pi) | (np.abs(y[:, 1]) > np.pi))
+
+
+def flip_times(y, p, horizon, dt, which=2, energy_cut=True):
+    """First time |theta| passes pi, for every row of y.
 
     which = 2 watches the lower rod (the usual definition), 1 the upper one,
     0 whichever goes first.
+
+    Returns (tf, doomed):
+        tf[i]      time of the first flip, or inf if there was none
+        doomed[i]  True when that point is PROVED never to flip, because its
+                   energy is below the floor and friction keeps it there.
+                   Rows with tf = inf and doomed = False are simply unfinished
+                   business: still swinging when the horizon ran out.
+
+    The energy cut only ever removes points that cannot flip, so the map it
+    produces is identical to the brute-force one, pixel for pixel.
     """
     rhs = make_rhs(p)
-    tf = np.full(y.shape[0], np.inf)
+    n = y.shape[0]
+    tf = np.full(n, np.inf)
+    doomed = np.zeros(n, dtype=bool)
+    floor = flip_floor(p)
+    damped = damping_matrix(p) is not None
+
+    live = np.arange(n)
+    if energy_cut:
+        # too cold to flip even before the first step - true with or without
+        # friction, since in neither case can the energy grow
+        cold = energy(y, p) < floor
+        doomed[cold] = True
+        live = live[~cold]
+    ys = np.ascontiguousarray(y[live])
+
     steps = int(round(horizon / dt))
     t, t0, last = 0.0, time.time(), 0.0
     for i in range(steps):
-        k1 = rhs(y)
-        k2 = rhs(y + 0.5 * dt * k1)
-        k3 = rhs(y + 0.5 * dt * k2)
-        k4 = rhs(y + dt * k3)
-        y += (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        if ys.shape[0] == 0:
+            break
+        k1 = rhs(ys)
+        k2 = rhs(ys + 0.5 * dt * k1)
+        k3 = rhs(ys + 0.5 * dt * k2)
+        k4 = rhs(ys + dt * k3)
+        ys += (dt / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
         t += dt
-        over = (np.abs(y[:, 1]) > np.pi) if which == 2 else \
-               (np.abs(y[:, 0]) > np.pi) if which == 1 else \
-               ((np.abs(y[:, 0]) > np.pi) | (np.abs(y[:, 1]) > np.pi))
-        fresh = over & ~np.isfinite(tf)
-        if fresh.any():
-            tf[fresh] = t
+
+        over = _over_the_top(ys, which)
+        if over.any():
+            tf[live[over]] = t
+        retire = over
+        if energy_cut and damped:
+            cold = energy(ys, p) < floor
+            doomed[live[cold & ~over]] = True
+            retire = over | cold
+        if retire.any():
+            keep = ~retire
+            live = live[keep]
+            ys = np.ascontiguousarray(ys[keep])
+
         if time.time() - last > 5:
             last = time.time()
-            print("   %3.0f %%   %5.0f s elapsed, %.0f %% already flipped"
+            print("   %3.0f %%   %5.0f s elapsed, %.0f %% flipped, "
+                  "%.0f %% settled, %d still running"
                   % (100 * (i + 1) / steps, last - t0,
-                     100 * np.isfinite(tf).mean()))
-    return tf
+                     100 * np.isfinite(tf).mean(), 100 * doomed.mean(),
+                     ys.shape[0]))
+    return tf, doomed
 
 
 def auto_name(args, n1, n2, friction, cmap_name):
@@ -277,12 +356,13 @@ def save_figure(fig, path, dpi=130):
     return write_somewhere(path, lambda f: fig.savefig(f, dpi=dpi))
 
 
-def save_csv(path, g1, g2, TF, head):
-    """The raw map: one line per starting point, columns th1, th2, time.
+def save_csv(path, g1, g2, TF, DOOM, head):
+    """The raw map: one line per starting point.
 
-    `head` is a list of lines; they are written as '#' comments, and the very
-    first line says how many of them there are, so the file can be read with
-    skip_header as well as with comment='#'.
+    Columns th1, th2, time, verdict. `head` is a list of lines; they are
+    written as '#' comments, and the very first line says how many of them
+    there are, so the file can be read with skip_header as well as with
+    comment='#'.
     """
     lines = ["dp_flipmap %s raw map - %d header lines start with '#', then the "
              "column names" % (__version__, len(head) + 1)] + list(head)
@@ -291,12 +371,16 @@ def save_csv(path, g1, g2, TF, head):
         with open(target, "w", encoding="utf-8", newline="") as fh:
             for ln in lines:
                 fh.write(("# " + ln if ln else "#") + "\n")
-            fh.write("th1_deg,th2_deg,time_s\n")
+            fh.write("th1_deg,th2_deg,time_s,verdict\n")
             for j, th2 in enumerate(g2):
                 for i, th1 in enumerate(g1):
                     t = TF[j, i]
-                    fh.write("%.4f,%.4f,%s\n"
-                             % (th1, th2, "" if not np.isfinite(t) else "%.4f" % t))
+                    if np.isfinite(t):
+                        fh.write("%.4f,%.4f,%.4f,flip\n" % (th1, th2, t))
+                    else:
+                        fh.write("%.4f,%.4f,,%s\n"
+                                 % (th1, th2,
+                                    "never" if DOOM[j, i] else "unknown"))
 
     return write_somewhere(path, writer)
 
@@ -329,6 +413,10 @@ def main():
     ap.add_argument("--flip-of", type=int, default=2, choices=(0, 1, 2),
                     help="which rod must go over the top: 2 (default), 1, "
                          "or 0 for whichever does it first")
+    ap.add_argument("--no-energy-cut", dest="energy_cut", action="store_false",
+                    help="integrate every point for the full horizon instead "
+                         "of retiring the ones that can no longer flip; "
+                         "slower, same picture")
     ap.add_argument("--mark", type=float, nargs=2, default=None,
                     metavar=("TH1", "TH2"), help="put a marker at this point")
     ap.add_argument("--colour", "--color", dest="colour", default="magma",
@@ -355,9 +443,13 @@ def main():
           % (p["m1"], p["m2"], p["l1"], p["l2"], p["l3"]))
     print("      I about the centres of mass: %.5f / %.5f kg m2"
           % (p["I1"], p["I2"]))
+    C = damping_matrix(p)
     print("      friction: %s"
-          % ("none (half1 = half2 = 0)" if damping_matrix(p) is None else
-             "tau = %.1f / %.1f s" % (p["tau1"], p["tau2"])))
+          % ("none (half1 = half2 = 0)" if C is None else
+             "tau = %.1f / %.1f s,  c1 = %.4g, c2 = %.4g N m s"
+             % (p["tau1"], p["tau2"],
+                (p["I1"] + p["m1"] * p["l1"] ** 2) / p["tau1"] if p["tau1"] > 0 else 0.0,
+                (p["I2"] + p["m2"] * p["l2"] ** 2) / p["tau2"] if p["tau2"] > 0 else 0.0)))
     w = normal_modes(p)
     print("      small oscillations: %.3f s (%.3f Hz) and %.3f s (%.3f Hz)"
           % (2 * np.pi / w[0], w[0] / 2 / np.pi,
@@ -366,6 +458,7 @@ def main():
             if abs(1 - 2 * e2 / e1) <= 1 else float("nan"))
     print("      a flip needs E > 2 e2 = %.4f J; on the line theta2_0 = 0 that "
           "is theta1_0 > %.2f deg" % (2 * e2, edge))
+    print("      energy cut: %s" % ("on" if args.energy_cut else "off"))
 
     g1 = np.linspace(args.th1[0], args.th1[1], max(1, n1))
     g2 = np.linspace(args.th2[0], args.th2[1], max(1, n2))
@@ -374,13 +467,23 @@ def main():
           "= %d runs of %.0f s"
           % (g1[0], g1[-1], len(g1), g2[0], g2[-1], len(g2), y.shape[0],
              args.horizon))
-    tf = flip_times(y, p, args.horizon, args.dt, args.flip_of)
+    t_start = time.time()
+    tf, doom = flip_times(y, p, args.horizon, args.dt, args.flip_of,
+                          args.energy_cut)
+    wall = time.time() - t_start
     TF = tf.reshape(G1.shape)
+    DOOM = doom.reshape(G1.shape)
     V = e1 * (1 - np.cos(np.radians(G1))) + e2 * (1 - np.cos(np.radians(G2)))
 
     ok = np.isfinite(tf)
-    print("\nflipped within %.0f s: %.1f %% of the rectangle"
+    unknown = ~ok & ~doom
+    print("\nfinished in %.0f s" % wall)
+    print("flipped within %.0f s      : %6.2f %% of the rectangle"
           % (args.horizon, 100 * ok.mean()))
+    print("proved never to flip      : %6.2f %%" % (100 * doom.mean()))
+    print("still swinging at the end : %6.2f %%" % (100 * unknown.mean()))
+    if unknown.any():
+        print("   (raise --horizon if you want those decided too)")
     if ok.any():
         print("earliest flip %.2f s, latest %.2f s" % (tf[ok].min(), tf[ok].max()))
 
@@ -421,19 +524,27 @@ def main():
         % (args.horizon, args.dt),
         "  flip = |theta%s| > 180 deg"
         % ({2: "2", 1: "1", 0: "1| or |theta2"}[args.flip_of]),
-        "  friction: %s" % ("none (half1 = half2 = 0)"
-                            if damping_matrix(p) is None else
-                            "bearings, tau = %.4g / %.4g s" % (p["tau1"], p["tau2"])),
+        "  energy cut: %s" % ("on - points below E = 2 e2 retired early"
+                              if args.energy_cut else "off - brute force"),
+        "  friction: %s" % ("none (half1 = half2 = 0)" if C is None else
+                            "bearings, tau = %.4g / %.4g s"
+                            % (p["tau1"], p["tau2"])),
         "result:",
+        "  wall clock: %.0f s" % wall,
         "  flipped within the horizon: %.2f %% of the grid" % (100 * ok.mean()),
+        "  proved never to flip      : %.2f %%" % (100 * doom.mean()),
+        "  still swinging at the end : %.2f %%" % (100 * unknown.mean()),
         "  earliest %s, latest %s"
         % (("%.4f s" % tf[ok].min()) if ok.any() else "-",
            ("%.4f s" % tf[ok].max()) if ok.any() else "-"),
         "",
         "columns: th1_deg, th2_deg = the starting angles from the downward "
         "vertical, + to the right;",
-        "         time_s = time to the first flip; EMPTY means no flip within "
-        "the horizon",
+        "         time_s = time to the first flip, EMPTY when there was none;",
+        "         verdict = flip | never | unknown.  'never' is a proof: the "
+        "energy fell below",
+        "         2 e2 and friction cannot give it back. 'unknown' only means "
+        "the horizon ran out.",
         "",
         "read with:  pandas.read_csv(path, comment='#')",
         "            numpy.genfromtxt(path, delimiter=',', names=True, "
@@ -442,15 +553,15 @@ def main():
 
     out = args.out or os.path.join(os.getcwd(),
                                    auto_name(args, len(g1), len(g2),
-                                             damping_matrix(p) is not None,
-                                             args.colour))
+                                             C is not None, args.colour))
     try:
         import matplotlib
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
-        # Every scheme runs dark (flips at once) to pale (flips just in time)
-        # and leaves pure white for "never flipped", so the white region reads
-        # as a category of its own rather than as the end of the scale.
+        # Every scheme runs dark (flips at once) to pale (flips just in time).
+        # Pure white is kept for "proved never", and a flat grey for "still
+        # swinging when the horizon ran out", so the two very different kinds
+        # of no-flip never get confused with each other or with a late flip.
         import matplotlib.colors as mcolors
         base, line = {
             "magma":     ("magma", "#00c2d4"),      # black-purple-orange-cream
@@ -467,6 +578,11 @@ def main():
         # shade leaves everything black; the square root keeps "darker =
         # sooner" while spreading the early times out
         norm = matplotlib.colors.PowerNorm(0.5, vmin=0.0, vmax=args.horizon)
+        unk = unknown.reshape(TF.shape)
+        if unk.any():
+            ax.pcolormesh(g1, g2, np.where(unk, 1.0, np.nan), shading="auto",
+                          cmap=mcolors.ListedColormap(["#9aa0a6"]),
+                          vmin=0, vmax=1)
         im = ax.pcolormesh(g1, g2, np.where(ok.reshape(TF.shape), TF, np.nan),
                            cmap=cmap, shading="auto", norm=norm)
         if V.min() < 2 * e2 < V.max():
@@ -476,9 +592,12 @@ def main():
                     mfc="none", mec=line, mew=1.8)
         ax.set_xlabel("theta1_0, deg")
         ax.set_ylabel("theta2_0, deg")
+        sub = ("white = never flips, proved" if C is not None else
+               "white = no flip within %.0f s" % args.horizon)
+        if unk.any():
+            sub += ";  grey = still swinging at %.0f s" % args.horizon
         ax.set_title("Time to the first flip\n"
-                     "dark = flips at once, pale = flips late, "
-                     "white = no flip within %.0f s" % args.horizon)
+                     "dark = flips at once, pale = flips late\n" + sub)
         cb = fig.colorbar(im, ax=ax, label="TTFF, s")
         cb.set_ticks([v for v in (0, 0.5, 1, 2, 3, 5, 7.5, 10, 15, 20, 30, 45, 60)
                       if v <= args.horizon] + [args.horizon])
@@ -492,7 +611,7 @@ def main():
 
     if not args.no_csv:
         csv_path = os.path.splitext(out)[0] + ".csv"
-        written = save_csv(csv_path, g1, g2, TF, meta)
+        written = save_csv(csv_path, g1, g2, TF, DOOM, meta)
         print("written: %s" % written if written else
               "THE CSV COULD NOT BE SAVED ANYWHERE")
 
